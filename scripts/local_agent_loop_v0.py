@@ -25,6 +25,14 @@ REQUIRED_TASK_ARTIFACTS = ("plan.md", "events.ndjson", "validation.json", "resul
 TASK_TIMESTAMP_FIELDS = ("deadline_ts", "unblocked_ts", "processed_ts")
 WORKTREE_METADATA_ARTIFACT = "worktree.json"
 WORKTREE_PROCESSED_BY = "local-agent-loop-worktree-v0"
+COMMAND_OUTPUTS_DIR = "command-outputs"
+DETERMINISTIC_FILE_ADAPTER = "deterministic-file-change"
+COMMAND_BACKED_PATCH_ADAPTER = "command-backed-patch-fixture"
+SUPPORTED_WORKTREE_ACTION_ADAPTERS = {
+    DETERMINISTIC_FILE_ADAPTER,
+    COMMAND_BACKED_PATCH_ADAPTER,
+}
+MAX_COMMAND_TIMEOUT_SEC = 30.0
 
 
 @dataclass
@@ -56,12 +64,36 @@ class WorktreeConfig:
     branch_prefix: str = "codex/local-agent-loop"
 
 
+@dataclass(frozen=True)
+class CommandSpec:
+    name: str
+    argv: list[str]
+    timeout_sec: float
+
+
+@dataclass(frozen=True)
+class WorktreeAction:
+    adapter: str
+    inputs: dict[str, Any]
+    expected_paths: list[Path]
+    expected_contents: dict[str, str]
+    action_command: CommandSpec | None = None
+
+
 class ValidationError(RuntimeError):
     """Raised when local loop JSON inputs are invalid."""
 
 
 class WorktreeExecutionError(RuntimeError):
     """Raised when a worktree-backed task cannot be executed safely."""
+
+
+class WorktreeCommandError(WorktreeExecutionError):
+    """Raised when a bounded local command fails after output capture."""
+
+    def __init__(self, message: str, outputs: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.outputs = outputs
 
 
 def utc_now() -> str:
@@ -167,9 +199,208 @@ def validate_relative_repo_path(path_text: str) -> Path:
     path = Path(path_text)
     if path.is_absolute() or ".." in path.parts:
         raise WorktreeExecutionError(f"unsafe worktree change path {path_text!r}")
+    if ".git" in path.parts:
+        raise WorktreeExecutionError(f"unsafe worktree change path {path_text!r}")
     if not path.parts:
         raise WorktreeExecutionError("worktree change path must not be empty")
     return path
+
+
+def require_object(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise WorktreeExecutionError(f"{label}: expected object")
+    return value
+
+
+def normalize_timeout(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WorktreeExecutionError(f"{label}: expected numeric timeout")
+    timeout = float(value)
+    if timeout <= 0 or timeout > MAX_COMMAND_TIMEOUT_SEC:
+        raise WorktreeExecutionError(
+            f"{label}: timeout must be > 0 and <= {MAX_COMMAND_TIMEOUT_SEC:g} seconds"
+        )
+    return timeout
+
+
+def normalize_command_argv(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise WorktreeExecutionError(f"{label}: expected non-empty argv list")
+    argv: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            raise WorktreeExecutionError(f"{label}[{index}]: expected non-empty string")
+        argv.append(item)
+    executable = Path(argv[0]).name
+    if executable in {"sh", "bash", "zsh", "fish"}:
+        raise WorktreeExecutionError(f"{label}: shell commands are not supported")
+    return argv
+
+
+def normalize_command_allowlist(value: Any, label: str) -> list[list[str]]:
+    if not isinstance(value, list) or not value:
+        raise WorktreeExecutionError(f"{label}: expected non-empty list of argv lists")
+    return [
+        normalize_command_argv(item, f"{label}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+
+def command_is_allowlisted(argv: list[str], allowlist: list[list[str]]) -> bool:
+    return any(argv == allowed for allowed in allowlist)
+
+
+def command_from_mapping(
+    mapping: dict[str, Any],
+    label: str,
+    allowlist: list[list[str]],
+) -> CommandSpec:
+    if "command" in mapping and "argv" in mapping and mapping["command"] != mapping["argv"]:
+        raise WorktreeExecutionError(f"{label}: command and argv disagree")
+    raw_argv = mapping.get("argv", mapping.get("command"))
+    argv = normalize_command_argv(raw_argv, f"{label}.argv")
+    if not command_is_allowlisted(argv, allowlist):
+        raise WorktreeExecutionError(f"{label}.argv: command is not allowlisted")
+    name = mapping.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise WorktreeExecutionError(f"{label}.name: expected non-empty string")
+    timeout = normalize_timeout(mapping.get("timeout_sec", 10), f"{label}.timeout_sec")
+    forbidden_keys = {"shell", "cwd", "env"}
+    present_forbidden = sorted(forbidden_keys & set(mapping))
+    if present_forbidden:
+        raise WorktreeExecutionError(
+            f"{label}: unsupported command fields {present_forbidden}"
+        )
+    return CommandSpec(name=name, argv=argv, timeout_sec=timeout)
+
+
+def task_action_contract(task: dict[str, Any]) -> dict[str, Any] | None:
+    has_local_action = "local_action" in task
+    has_action = "action" in task
+    if has_local_action and has_action and task["local_action"] != task["action"]:
+        raise WorktreeExecutionError("ambiguous action contract: local_action and action differ")
+    raw = task.get("local_action") if has_local_action else task.get("action")
+    if raw is None:
+        return None
+    return require_object(raw, "local_action")
+
+
+def deterministic_action_from_inputs(task: dict[str, Any], inputs: dict[str, Any]) -> WorktreeAction:
+    path_value = inputs.get("path", task.get("worktree_change_path"))
+    if path_value is None:
+        path = worktree_change_path(task)
+    elif not isinstance(path_value, str) or not path_value.strip():
+        raise WorktreeExecutionError("local_action.inputs.path: expected non-empty string")
+    else:
+        path = validate_relative_repo_path(path_value)
+
+    content_value = inputs.get("content", task.get("worktree_change_content"))
+    if content_value is None:
+        content = worktree_change_content({**task, "worktree_change_path": path.as_posix()})
+    elif not isinstance(content_value, str):
+        raise WorktreeExecutionError("local_action.inputs.content: expected string")
+    else:
+        content = content_value if content_value.endswith("\n") else content_value + "\n"
+
+    return WorktreeAction(
+        adapter=DETERMINISTIC_FILE_ADAPTER,
+        inputs={"path": path.as_posix(), "content": content},
+        expected_paths=[path],
+        expected_contents={path.as_posix(): content},
+    )
+
+
+def command_backed_action_from_inputs(inputs: dict[str, Any]) -> WorktreeAction:
+    allowlist = normalize_command_allowlist(
+        inputs.get("allowed_commands"),
+        "local_action.inputs.allowed_commands",
+    )
+    command_mapping = {
+        "name": inputs.get("name", "patch-fixture"),
+        "timeout_sec": inputs.get("timeout_sec", 10),
+    }
+    if "command" in inputs:
+        command_mapping["command"] = inputs["command"]
+    if "argv" in inputs:
+        command_mapping["argv"] = inputs["argv"]
+    command = command_from_mapping(
+        command_mapping,
+        "local_action.inputs.command",
+        allowlist,
+    )
+    raw_expected_path = inputs.get("expected_path")
+    if not isinstance(raw_expected_path, str) or not raw_expected_path.strip():
+        raise WorktreeExecutionError(
+            "local_action.inputs.expected_path: expected non-empty string"
+        )
+    expected_path = validate_relative_repo_path(raw_expected_path)
+    expected_content = inputs.get("expected_content")
+    if not isinstance(expected_content, str):
+        raise WorktreeExecutionError("local_action.inputs.expected_content: expected string")
+    if not expected_content.endswith("\n"):
+        expected_content += "\n"
+    return WorktreeAction(
+        adapter=COMMAND_BACKED_PATCH_ADAPTER,
+        inputs={
+            "name": command.name,
+            "command": command.argv,
+            "timeout_sec": command.timeout_sec,
+            "expected_path": expected_path.as_posix(),
+            "expected_content": expected_content,
+        },
+        expected_paths=[expected_path],
+        expected_contents={expected_path.as_posix(): expected_content},
+        action_command=command,
+    )
+
+
+def resolve_worktree_action(task: dict[str, Any]) -> WorktreeAction:
+    raw = task_action_contract(task)
+    if raw is None:
+        return deterministic_action_from_inputs(task, {})
+    adapter = raw.get("adapter")
+    if not isinstance(adapter, str) or not adapter.strip():
+        raise WorktreeExecutionError("local_action.adapter: expected non-empty string")
+    if adapter not in SUPPORTED_WORKTREE_ACTION_ADAPTERS:
+        raise WorktreeExecutionError(f"unknown worktree action adapter {adapter!r}")
+    inputs = raw.get("inputs", {})
+    if not isinstance(inputs, dict):
+        raise WorktreeExecutionError("local_action.inputs: expected object")
+    if adapter == DETERMINISTIC_FILE_ADAPTER:
+        return deterministic_action_from_inputs(task, inputs)
+    return command_backed_action_from_inputs(inputs)
+
+
+def validation_command_allowlist(task: dict[str, Any]) -> list[list[str]]:
+    raw = task.get("validation_command_allowlist", task.get("allowed_validation_commands"))
+    if raw is None:
+        return []
+    return normalize_command_allowlist(raw, "validation_command_allowlist")
+
+
+def resolve_validation_commands(task: dict[str, Any]) -> list[CommandSpec]:
+    raw = task.get("validation_commands")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise WorktreeExecutionError("validation_commands: expected list")
+    allowlist = validation_command_allowlist(task)
+    if not allowlist:
+        raise WorktreeExecutionError(
+            "validation_commands require validation_command_allowlist"
+        )
+    commands: list[CommandSpec] = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(raw):
+        mapping = require_object(item, f"validation_commands[{index}]")
+        command = command_from_mapping(mapping, f"validation_commands[{index}]", allowlist)
+        if command.name in seen_names:
+            raise WorktreeExecutionError(
+                f"validation_commands[{index}].name: duplicate name {command.name!r}"
+            )
+        seen_names.add(command.name)
+        commands.append(command)
+    return commands
 
 
 def worktree_change_path(task: dict[str, Any]) -> Path:
@@ -386,22 +617,33 @@ def write_artifacts(task: dict[str, Any], task_dir: Path, validation_result: dic
         write_json(task_dir / "validation.json", validation_result)
 
 
-def write_worktree_plan(task: dict[str, Any], task_dir: Path, cfg: WorktreeConfig) -> None:
+def write_worktree_plan(
+    task: dict[str, Any],
+    task_dir: Path,
+    cfg: WorktreeConfig,
+    action: WorktreeAction,
+    validation_commands: list[CommandSpec],
+) -> None:
     plan = task_dir / "plan.md"
     if plan.exists():
         return
     branch = worktree_branch_name(task["id"], cfg)
     worktree_path = worktree_path_for_task(task["id"], cfg)
-    change_path = worktree_change_path(task)
+    change_paths = ", ".join(path.as_posix() for path in action.expected_paths)
+    validation_names = ", ".join(command.name for command in validation_commands) or "built-in"
     plan.write_text(
         "# Plan\n\n"
         "1. Create or reuse the deterministic task branch and worktree.\n"
-        "2. Apply the deterministic fixture change.\n"
-        "3. Run local validation checks.\n"
-        "4. Commit successful work and write execution metadata.\n\n"
+        "2. Resolve the declarative local action adapter.\n"
+        "3. Apply the local fixture change.\n"
+        "4. Run local validation checks.\n"
+        "5. Capture command evidence when configured.\n"
+        "6. Commit successful work and write execution metadata.\n\n"
         f"- Branch: `{branch}`\n"
         f"- Worktree: `{worktree_path}`\n"
-        f"- Change path: `{change_path.as_posix()}`\n",
+        f"- Action adapter: `{action.adapter}`\n"
+        f"- Change path(s): `{change_paths}`\n"
+        f"- Validation command(s): `{validation_names}`\n",
         encoding="utf-8",
     )
 
@@ -421,6 +663,13 @@ def initial_worktree_metadata(task: dict[str, Any], cfg: WorktreeConfig) -> dict
         "worktree_preexisted": None,
         "dirty_status_before": [],
         "dirty_status_after": [],
+        "action_adapter": None,
+        "action_inputs": None,
+        "expected_change_paths": [],
+        "action_command_outputs": [],
+        "validation_commands": [],
+        "validation_command_outputs": [],
+        "command_timed_out": False,
         "change_path": None,
         "validation_output": None,
         "final_task_state": task.get("state"),
@@ -479,6 +728,7 @@ def verify_recoverable_task_commit(
     task: dict[str, Any],
     worktree_path: Path,
     base_sha: str,
+    action: WorktreeAction,
 ) -> str | None:
     head_sha = run_git(worktree_path, ["rev-parse", "HEAD"], check=True).stdout.strip()
     if head_sha == base_sha:
@@ -504,7 +754,7 @@ def verify_recoverable_task_commit(
             "preexisting task branch has ambiguous history; expected exactly one task commit"
         )
 
-    change_path = worktree_change_path(task)
+    expected_paths = [path.as_posix() for path in action.expected_paths]
     changed_paths = [
         line.strip()
         for line in run_git(
@@ -514,55 +764,204 @@ def verify_recoverable_task_commit(
         ).stdout.splitlines()
         if line.strip()
     ]
-    if changed_paths != [change_path.as_posix()]:
+    if changed_paths != expected_paths:
         raise WorktreeExecutionError(
             "preexisting task branch changes do not match the deterministic task path"
         )
 
-    expected_content = worktree_change_content(task)
-    actual_path = worktree_path / change_path
-    if not actual_path.exists() or actual_path.read_text(encoding="utf-8") != expected_content:
-        raise WorktreeExecutionError(
-            "preexisting task branch content does not match the deterministic fixture"
-        )
+    for path_text, expected_content in action.expected_contents.items():
+        actual_path = worktree_path / path_text
+        if not actual_path.exists() or actual_path.read_text(encoding="utf-8") != expected_content:
+            raise WorktreeExecutionError(
+                "preexisting task branch content does not match the action contract"
+            )
 
     return head_sha
 
 
-def apply_worktree_change(task: dict[str, Any], worktree_path: Path) -> tuple[Path, str]:
-    change_path = worktree_change_path(task)
-    content = worktree_change_content(task)
-    absolute_path = worktree_path / change_path
-    absolute_path.parent.mkdir(parents=True, exist_ok=True)
-    if not absolute_path.exists() or absolute_path.read_text(encoding="utf-8") != content:
-        absolute_path.write_text(content, encoding="utf-8")
-    return change_path, content
+def git_pending_paths(worktree_path: Path) -> list[str]:
+    diff_paths = [
+        line.strip()
+        for line in run_git(worktree_path, ["diff", "--name-only"], check=True).stdout.splitlines()
+        if line.strip()
+    ]
+    untracked_paths = [
+        line.strip()
+        for line in run_git(
+            worktree_path,
+            ["ls-files", "--others", "--exclude-standard"],
+            check=True,
+        ).stdout.splitlines()
+        if line.strip()
+    ]
+    return sorted({*diff_paths, *untracked_paths})
 
 
-def validate_worktree_change(
+def ensure_only_expected_paths_changed(worktree_path: Path, expected_paths: list[Path]) -> None:
+    actual = git_pending_paths(worktree_path)
+    expected = sorted(path.as_posix() for path in expected_paths)
+    if actual != expected:
+        raise WorktreeExecutionError(
+            f"action changed unexpected paths; got {actual!r}, expected {expected!r}"
+        )
+
+
+def command_artifact_relative_path(kind: str, index: int, name: str) -> Path:
+    safe_name = slugify_ref_component(name).lower()[:48] or "command"
+    return Path(COMMAND_OUTPUTS_DIR) / f"{kind}-{index:03d}-{safe_name}.json"
+
+
+def text_from_timeout_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def run_local_command(
     task: dict[str, Any],
     worktree_path: Path,
-    change_path: Path,
-    expected_content: str,
+    task_dir: Path,
+    command: CommandSpec,
+    kind: str,
+    index: int,
 ) -> dict[str, Any]:
-    actual_path = worktree_path / change_path
-    exists = actual_path.exists()
-    actual_content = actual_path.read_text(encoding="utf-8") if exists else ""
-    content_matches = exists and actual_content == expected_content
+    relative_artifact = command_artifact_relative_path(kind, index, command.name)
+    output_path = task_dir / relative_artifact
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        completed = subprocess.run(
+            command.argv,
+            cwd=worktree_path,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=command.timeout_sec,
+        )
+        output = {
+            "schema_version": SCHEMA_VERSION,
+            "task_id": task["id"],
+            "kind": kind,
+            "name": command.name,
+            "argv": command.argv,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "timed_out": False,
+            "timeout_sec": command.timeout_sec,
+            "output_artifact": relative_artifact.as_posix(),
+        }
+    except subprocess.TimeoutExpired as exc:
+        output = {
+            "schema_version": SCHEMA_VERSION,
+            "task_id": task["id"],
+            "kind": kind,
+            "name": command.name,
+            "argv": command.argv,
+            "returncode": None,
+            "stdout": text_from_timeout_value(exc.stdout),
+            "stderr": text_from_timeout_value(exc.stderr),
+            "timed_out": True,
+            "timeout_sec": command.timeout_sec,
+            "output_artifact": relative_artifact.as_posix(),
+        }
+    write_json(output_path, output)
+    return output
+
+
+def apply_worktree_action(
+    task: dict[str, Any],
+    worktree_path: Path,
+    task_dir: Path,
+    action: WorktreeAction,
+) -> list[dict[str, Any]]:
+    command_outputs: list[dict[str, Any]] = []
+    if action.adapter == DETERMINISTIC_FILE_ADAPTER:
+        for path_text, content in action.expected_contents.items():
+            absolute_path = worktree_path / path_text
+            absolute_path.parent.mkdir(parents=True, exist_ok=True)
+            if not absolute_path.exists() or absolute_path.read_text(encoding="utf-8") != content:
+                absolute_path.write_text(content, encoding="utf-8")
+    elif action.adapter == COMMAND_BACKED_PATCH_ADAPTER:
+        if action.action_command is None:
+            raise WorktreeExecutionError("command-backed adapter missing action command")
+        output = run_local_command(
+            task,
+            worktree_path,
+            task_dir,
+            action.action_command,
+            "action",
+            0,
+        )
+        command_outputs.append(output)
+        if output["timed_out"]:
+            raise WorktreeCommandError("action command timed out", command_outputs)
+        if output["returncode"] != 0:
+            raise WorktreeCommandError(
+                f"action command failed with exit code {output['returncode']}",
+                command_outputs,
+            )
+    else:
+        raise WorktreeExecutionError(f"unknown worktree action adapter {action.adapter!r}")
+    try:
+        ensure_only_expected_paths_changed(worktree_path, action.expected_paths)
+    except WorktreeExecutionError as exc:
+        if command_outputs:
+            raise WorktreeCommandError(str(exc), command_outputs) from exc
+        raise
+    return command_outputs
+
+
+def validate_worktree_action(
+    task: dict[str, Any],
+    worktree_path: Path,
+    task_dir: Path,
+    action: WorktreeAction,
+    validation_commands: list[CommandSpec],
+) -> dict[str, Any]:
     simulated_failure = bool(task.get("simulate_worktree_validation_fail"))
     required_checks = task.get("required_checks") or ["fixture-change"]
     checks = []
-    for check in required_checks:
+    for path_text, expected_content in action.expected_contents.items():
+        actual_path = worktree_path / path_text
+        exists = actual_path.exists()
+        actual_content = actual_path.read_text(encoding="utf-8") if exists else ""
+        content_matches = exists and actual_content == expected_content
         passed = content_matches and not simulated_failure
         checks.append(
             {
-                "name": check,
+                "name": f"expected-content:{path_text}",
                 "passed": passed,
                 "output": (
-                    "deterministic fixture change verified"
+                    "action output content verified"
                     if passed
-                    else "deterministic fixture validation failed"
+                    else "action output content validation failed"
                 ),
+            }
+        )
+
+    validation_outputs = [
+        run_local_command(task, worktree_path, task_dir, command, "validation", index)
+        for index, command in enumerate(validation_commands)
+    ]
+    for output in validation_outputs:
+        passed = output["returncode"] == 0 and not output["timed_out"]
+        checks.append(
+            {
+                "name": output["name"],
+                "passed": passed,
+                "output": (
+                    "validation command passed"
+                    if passed
+                    else "validation command failed"
+                ),
+                "exit_code": output["returncode"],
+                "timed_out": output["timed_out"],
+                "output_artifact": output["output_artifact"],
             }
         )
     passed = bool(checks) and all(check["passed"] for check in checks)
@@ -573,8 +972,18 @@ def validate_worktree_change(
         "passed": passed,
         "message": message,
         "required_checks": required_checks,
+        "action_adapter": action.adapter,
         "checks": checks,
-        "change_path": change_path.as_posix(),
+        "change_paths": [path.as_posix() for path in action.expected_paths],
+        "validation_commands": [
+            {
+                "name": command.name,
+                "argv": command.argv,
+                "timeout_sec": command.timeout_sec,
+            }
+            for command in validation_commands
+        ],
+        "validation_command_outputs": validation_outputs,
         "timestamp": utc_now(),
     }
 
@@ -586,6 +995,15 @@ def record_worktree_validation_failure(
     message: str,
     checks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    plan = task_dir / "plan.md"
+    if not plan.exists():
+        plan.write_text(
+            "# Plan\n\n"
+            "1. Validate the worktree action contract.\n"
+            "2. Stop before local mutation when the contract is unsafe or incomplete.\n"
+            "3. Record diagnostics for operator review.\n",
+            encoding="utf-8",
+        )
     validation_result = {
         "schema_version": SCHEMA_VERSION,
         "task_id": task["id"],
@@ -605,13 +1023,18 @@ def record_worktree_validation_failure(
 def commit_worktree_change(
     task: dict[str, Any],
     worktree_path: Path,
-    change_path: Path,
+    change_paths: list[Path],
     base_sha: str,
     preexisting_commit_sha: str | None = None,
 ) -> tuple[str, bool, GitResult | None]:
     status = git_status_lines(worktree_path)
     if status:
-        run_git(worktree_path, ["add", "--", change_path.as_posix()], check=True)
+        ensure_only_expected_paths_changed(worktree_path, change_paths)
+        run_git(
+            worktree_path,
+            ["add", "--", *[path.as_posix() for path in change_paths]],
+            check=True,
+        )
         commit_result = run_git(
             worktree_path,
             ["commit", "-m", f"local-agent-loop: {task['id']}"],
@@ -631,7 +1054,8 @@ def commit_worktree_change(
                 "preexisting task commit changed before commit finalization"
             )
         return head_sha, True, None
-    verify_recoverable_task_commit(task, worktree_path, base_sha)
+    action = resolve_worktree_action(task)
+    verify_recoverable_task_commit(task, worktree_path, base_sha, action)
     return head_sha, True, None
 
 
@@ -642,14 +1066,19 @@ def write_worktree_result(
 ) -> None:
     commit_sha = metadata.get("commit_sha") or "none"
     validation = metadata.get("validation_output") or {}
+    validation_outputs = metadata.get("validation_command_outputs") or []
+    timed_out = metadata.get("command_timed_out")
     (task_dir / "result.md").write_text(
         "# Worktree Task Result\n\n"
         f"- Task: `{task['id']}`\n"
         f"- Final state: `{task['state']}`\n"
+        f"- Action adapter: `{metadata.get('action_adapter')}`\n"
         f"- Branch: `{metadata.get('branch_name')}`\n"
         f"- Worktree: `{metadata.get('worktree_path')}`\n"
         f"- Commit: `{commit_sha}`\n"
         f"- Validation passed: `{validation.get('passed')}`\n"
+        f"- Validation command outputs: `{len(validation_outputs)}`\n"
+        f"- Command timed out: `{timed_out}`\n"
         f"- Updated: `{utc_now()}`\n",
         encoding="utf-8",
     )
@@ -675,6 +1104,7 @@ def recover_worktree_task_from_terminal_artifacts(task: dict[str, Any], task_dir
                 ("base_ref", "worktree_base_ref"),
                 ("change_path", "worktree_change_path"),
                 ("commit_sha", "worktree_commit_sha"),
+                ("action_adapter", "worktree_action_adapter"),
             ):
                 value = metadata.get(metadata_field)
                 if isinstance(value, str) and value:
@@ -698,63 +1128,108 @@ def execute_worktree_task(
     if recover_worktree_task_from_terminal_artifacts(task, task_dir):
         return task
 
-    if task["state"] == "OPEN":
-        transition(task, "CLAIMED", "Worker claimed worktree task", events_file)
-    if task["state"] == "CLAIMED":
-        write_worktree_plan(task, task_dir, cfg)
-        transition(task, "PLANNED", "Worktree plan created", events_file)
-    if task["state"] == "PLANNED":
-        transition(task, "EXECUTING", "Worktree execution started", events_file)
-    if task["state"] == "EXECUTING":
-        transition(task, "VALIDATING", "Worktree change ready for validation", events_file)
+    raw_action_for_metadata = task.get("local_action", task.get("action"))
+    if isinstance(raw_action_for_metadata, dict):
+        raw_adapter = raw_action_for_metadata.get("adapter")
+        raw_inputs = raw_action_for_metadata.get("inputs")
+        if isinstance(raw_adapter, str) and raw_adapter.strip():
+            metadata["action_adapter"] = raw_adapter
+        if isinstance(raw_inputs, dict):
+            metadata["action_inputs"] = raw_inputs
 
-    if task["state"] == "VALIDATING":
-        try:
-            ensured = ensure_task_worktree(task, cfg)
-            metadata.update(ensured)
-            worktree_path = Path(ensured["worktree_path"])
-            dirty_before = git_status_lines(worktree_path)
-            metadata["dirty_status_before"] = dirty_before
-            if dirty_before:
-                record_worktree_validation_failure(
-                    task,
-                    task_dir,
-                    metadata,
-                    "Worktree is dirty before execution; refusing to mutate",
-                    [
-                        {
-                            "name": "dirty-worktree-guard",
-                            "passed": False,
-                            "output": "\n".join(dirty_before),
-                        }
-                    ],
-                )
-                transition(task, "FAILED", "Dirty worktree guard failed", events_file)
-            else:
-                preexisting_commit_sha = verify_recoverable_task_commit(
-                    task,
-                    worktree_path,
-                    ensured["base_sha"],
-                )
-                change_path, expected_content = apply_worktree_change(task, worktree_path)
-                metadata["change_path"] = change_path.as_posix()
-                validation_result = validate_worktree_change(
-                    task,
-                    worktree_path,
-                    change_path,
-                    expected_content,
-                )
-                metadata["validation_output"] = validation_result
-                write_json(task_dir / "validation.json", validation_result)
-                if validation_result["passed"]:
+    try:
+        action = resolve_worktree_action(task)
+        validation_commands = resolve_validation_commands(task)
+        if action.adapter == COMMAND_BACKED_PATCH_ADAPTER and not validation_commands:
+            raise WorktreeExecutionError(
+                "command-backed-patch-fixture requires validation_commands"
+            )
+        metadata["action_adapter"] = action.adapter
+        metadata["action_inputs"] = action.inputs
+        metadata["expected_change_paths"] = [
+            path.as_posix() for path in action.expected_paths
+        ]
+        metadata["validation_commands"] = [
+            {
+                "name": command.name,
+                "argv": command.argv,
+                "timeout_sec": command.timeout_sec,
+            }
+            for command in validation_commands
+        ]
+    except (ValidationError, WorktreeExecutionError) as exc:
+        record_worktree_validation_failure(task, task_dir, metadata, str(exc))
+        transition(task, "FAILED", "Worktree action contract rejected", events_file)
+    else:
+        if task["state"] == "OPEN":
+            transition(task, "CLAIMED", "Worker claimed worktree task", events_file)
+        if task["state"] == "CLAIMED":
+            write_worktree_plan(task, task_dir, cfg, action, validation_commands)
+            transition(task, "PLANNED", "Worktree plan created", events_file)
+        if task["state"] == "PLANNED":
+            transition(task, "EXECUTING", "Worktree execution started", events_file)
+        if task["state"] == "EXECUTING":
+            transition(task, "VALIDATING", "Worktree change ready for validation", events_file)
+
+        if task["state"] == "VALIDATING":
+            try:
+                ensured = ensure_task_worktree(task, cfg)
+                metadata.update(ensured)
+                worktree_path = Path(ensured["worktree_path"])
+                dirty_before = git_status_lines(worktree_path)
+                metadata["dirty_status_before"] = dirty_before
+                if dirty_before:
+                    record_worktree_validation_failure(
+                        task,
+                        task_dir,
+                        metadata,
+                        "Worktree is dirty before execution; refusing to mutate",
+                        [
+                            {
+                                "name": "dirty-worktree-guard",
+                                "passed": False,
+                                "output": "\n".join(dirty_before),
+                            }
+                        ],
+                    )
+                    transition(task, "FAILED", "Dirty worktree guard failed", events_file)
+                else:
+                    preexisting_commit_sha = verify_recoverable_task_commit(
+                        task,
+                        worktree_path,
+                        ensured["base_sha"],
+                        action,
+                    )
                     try:
-                        commit_sha, reused, commit_result = commit_worktree_change(
-                            task,
-                            worktree_path,
-                            change_path,
-                            ensured["base_sha"],
-                            preexisting_commit_sha,
+                        action_outputs = (
+                            []
+                            if preexisting_commit_sha is not None
+                            else apply_worktree_action(
+                                task,
+                                worktree_path,
+                                task_dir,
+                                action,
+                            )
                         )
+                    except WorktreeCommandError as exc:
+                        metadata["action_command_outputs"] = exc.outputs
+                        metadata["command_timed_out"] = any(
+                            output.get("timed_out") for output in exc.outputs
+                        )
+                        record_worktree_validation_failure(
+                            task,
+                            task_dir,
+                            metadata,
+                            str(exc),
+                            [
+                                {
+                                    "name": "action-command",
+                                    "passed": False,
+                                    "output": str(exc),
+                                }
+                            ],
+                        )
+                        transition(task, "FAILED", "Worktree action command failed", events_file)
                     except WorktreeExecutionError as exc:
                         record_worktree_validation_failure(
                             task,
@@ -763,35 +1238,85 @@ def execute_worktree_task(
                             str(exc),
                             [
                                 {
-                                    "name": "commit",
+                                    "name": "action-contract",
                                     "passed": False,
                                     "output": str(exc),
                                 }
                             ],
                         )
-                        transition(task, "FAILED", "Worktree commit failed", events_file)
+                        transition(task, "FAILED", "Worktree action failed", events_file)
                     else:
-                        metadata["commit_sha"] = commit_sha
-                        metadata["commit_reused"] = reused
-                        metadata["commit_result"] = (
-                            commit_result.as_dict() if commit_result is not None else None
+                        metadata["action_command_outputs"] = action_outputs
+                        metadata["command_timed_out"] = any(
+                            output.get("timed_out")
+                            for output in action_outputs
                         )
-                        task["worktree_branch"] = metadata["branch_name"]
-                        task["worktree_path"] = metadata["worktree_path"]
-                        task["worktree_base_ref"] = cfg.base_ref
-                        task["worktree_change_path"] = change_path.as_posix()
-                        task["worktree_commit_sha"] = commit_sha
-                        transition(
+                        metadata["change_path"] = action.expected_paths[0].as_posix()
+                        validation_result = validate_worktree_action(
                             task,
-                            "DONE",
-                            "Worktree validation passed and committed",
-                            events_file,
+                            worktree_path,
+                            task_dir,
+                            action,
+                            validation_commands,
                         )
-                else:
-                    transition(task, "FAILED", "Worktree validation failed", events_file)
-        except (ValidationError, WorktreeExecutionError) as exc:
-            record_worktree_validation_failure(task, task_dir, metadata, str(exc))
-            transition(task, "FAILED", "Worktree execution failed before mutation", events_file)
+                        metadata["validation_output"] = validation_result
+                        metadata["validation_command_outputs"] = validation_result[
+                            "validation_command_outputs"
+                        ]
+                        metadata["command_timed_out"] = metadata["command_timed_out"] or any(
+                            output.get("timed_out")
+                            for output in metadata["validation_command_outputs"]
+                        )
+                        write_json(task_dir / "validation.json", validation_result)
+                        if validation_result["passed"]:
+                            try:
+                                commit_sha, reused, commit_result = commit_worktree_change(
+                                    task,
+                                    worktree_path,
+                                    action.expected_paths,
+                                    ensured["base_sha"],
+                                    preexisting_commit_sha,
+                                )
+                            except WorktreeExecutionError as exc:
+                                record_worktree_validation_failure(
+                                    task,
+                                    task_dir,
+                                    metadata,
+                                    str(exc),
+                                    [
+                                        {
+                                            "name": "commit",
+                                            "passed": False,
+                                            "output": str(exc),
+                                        }
+                                    ],
+                                )
+                                transition(task, "FAILED", "Worktree commit failed", events_file)
+                            else:
+                                metadata["commit_sha"] = commit_sha
+                                metadata["commit_reused"] = reused
+                                metadata["commit_result"] = (
+                                    commit_result.as_dict() if commit_result is not None else None
+                                )
+                                task["worktree_branch"] = metadata["branch_name"]
+                                task["worktree_path"] = metadata["worktree_path"]
+                                task["worktree_base_ref"] = cfg.base_ref
+                                task["worktree_change_path"] = action.expected_paths[
+                                    0
+                                ].as_posix()
+                                task["worktree_action_adapter"] = action.adapter
+                                task["worktree_commit_sha"] = commit_sha
+                                transition(
+                                    task,
+                                    "DONE",
+                                    "Worktree validation passed and committed",
+                                    events_file,
+                                )
+                        else:
+                            transition(task, "FAILED", "Worktree validation failed", events_file)
+            except (ValidationError, WorktreeExecutionError) as exc:
+                record_worktree_validation_failure(task, task_dir, metadata, str(exc))
+                transition(task, "FAILED", "Worktree execution failed before mutation", events_file)
 
     if task["state"] in TERMINAL_STATES:
         task["processed_by"] = WORKTREE_PROCESSED_BY
@@ -800,11 +1325,14 @@ def execute_worktree_task(
         if metadata["commit_sha"] is None:
             task.pop("worktree_commit_sha", None)
         metadata_path = Path(metadata["worktree_path"])
-        metadata["dirty_status_after"] = (
-            git_status_lines(metadata_path)
-            if (metadata_path / ".git").exists()
-            else []
-        )
+        try:
+            metadata["dirty_status_after"] = (
+                git_status_lines(metadata_path)
+                if (metadata_path / ".git").exists()
+                else []
+            )
+        except WorktreeExecutionError as exc:
+            metadata["dirty_status_after"] = [f"git status failed: {exc}"]
         write_json(task_dir / WORKTREE_METADATA_ARTIFACT, metadata)
 
     write_worktree_result(task, task_dir, metadata)

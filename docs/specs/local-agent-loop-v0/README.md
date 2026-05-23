@@ -52,7 +52,8 @@ The operator entrypoint is `scripts/local_program_loop_v0.py`:
   writes program artifacts, and verifies artifact integrity.
 - `status` prints a compact JSON status snapshot and optional artifact errors.
 - `run-worker` and `run-program` can opt into v0.4 git worktree execution with
-  `--execution-mode worktree`.
+  `--execution-mode worktree`. v0.5 keeps that mode explicit and adds
+  policy-driven local action adapters for worktree tasks.
 
 The worker script still supports direct task execution through
 `scripts/local_agent_loop_v0.py`, but the program CLI is the preferred
@@ -101,7 +102,7 @@ python3 scripts/local_program_loop_v0.py status \
 
 ## Worktree-Backed Execution
 
-v0.4 adds an optional local git worktree executor around the same v0.3
+v0.4 added an optional local git worktree executor around the same v0.3
 program/queue schema. The default command path remains the dependency-light
 state-machine worker; worktree mode is only enabled when explicitly requested.
 
@@ -141,6 +142,139 @@ python3 scripts/local_program_loop_v0.py run-program \
 
 Re-running the same command reuses the same task branches and worktrees, skips
 terminal tasks, and does not create duplicate task commits.
+
+## v0.5 Action Adapter Contract
+
+v0.5 lets a queue task choose a small built-in local action adapter with
+`local_action`. If `local_action` is omitted, worktree mode uses the v0.4
+deterministic file fixture adapter.
+
+Supported adapters:
+
+- `deterministic-file-change`: writes one safe relative file. Inputs are
+  `path` and `content`; legacy `worktree_change_path` and
+  `worktree_change_content` still work.
+- `command-backed-patch-fixture`: runs one bounded local command that must be
+  exactly present in `local_action.inputs.allowed_commands`, then verifies one
+  expected relative path and expected content before validation.
+
+Validation commands are also declarative and allowlisted:
+
+- `validation_commands[].command` must be an argv array, not a shell string.
+- `validation_command_allowlist` must include the exact argv array for every
+  validation command.
+- `timeout_sec` must be greater than `0` and no more than `30`.
+- Command stdout, stderr, exit code, timeout status, argv, and stable output
+  artifact path are captured under each task's `command-outputs/` directory.
+
+The worker rejects unknown adapters, unsafe paths, missing validation evidence
+for command-backed actions, non-argv command strings, non-allowlisted commands,
+dirty worktrees before mutation, and unexpected changed paths. Command-backed
+execution is local-only, uses `subprocess` without a shell, and records failure
+diagnostics without a success commit.
+
+## Command-Backed Adapter Smoke
+
+This example creates a clean disposable target repository and a one-task queue.
+The single `run-program` command executes a named action adapter, validates via
+an allowlisted local command, commits success, and verifies artifacts:
+
+```bash
+adapter_tmp="$(mktemp -d)"
+target_repo="$adapter_tmp/target-repo"
+mkdir -p "$target_repo"
+git -C "$target_repo" init
+git -C "$target_repo" config user.name "Local Agent Loop"
+git -C "$target_repo" config user.email "loop@example.invalid"
+printf '# Fixture Repository\n' > "$target_repo/README.md"
+git -C "$target_repo" add README.md
+git -C "$target_repo" commit -m "Initial fixture"
+git -C "$target_repo" branch -M main
+
+cat > "$adapter_tmp/program.json" <<'JSON'
+{
+  "schema_version": "local-agent-loop-v0.3",
+  "program_id": "adapter-smoke",
+  "goal": "Run a command-backed local action adapter",
+  "program_state": "IDLE",
+  "last_roadmap_review_ts": "2026-01-01T00:00:00+00:00",
+  "roadmap_backlog": [],
+  "review_log": []
+}
+JSON
+
+cat > "$adapter_tmp/queue.json" <<'JSON'
+{
+  "schema_version": "local-agent-loop-v0.3",
+  "tasks": [
+    {
+      "id": "task-command-backed",
+      "title": "Command-backed adapter smoke",
+      "state": "OPEN",
+      "retries": 0,
+      "required_checks": ["command-fixture"],
+      "local_action": {
+        "adapter": "command-backed-patch-fixture",
+        "inputs": {
+          "name": "write-command-fixture",
+          "command": [
+            "python3",
+            "-c",
+            "from pathlib import Path; p=Path('agent-loop-results/command-backed-fixture.md'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('# Command Backed Fixture\\n\\nTask: task-command-backed\\n', encoding='utf-8')"
+          ],
+          "allowed_commands": [
+            [
+              "python3",
+              "-c",
+              "from pathlib import Path; p=Path('agent-loop-results/command-backed-fixture.md'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('# Command Backed Fixture\\n\\nTask: task-command-backed\\n', encoding='utf-8')"
+            ]
+          ],
+          "timeout_sec": 5,
+          "expected_path": "agent-loop-results/command-backed-fixture.md",
+          "expected_content": "# Command Backed Fixture\n\nTask: task-command-backed\n"
+        }
+      },
+      "validation_commands": [
+        {
+          "name": "verify-command-fixture",
+          "command": [
+            "python3",
+            "-c",
+            "from pathlib import Path; data=Path('agent-loop-results/command-backed-fixture.md').read_text(encoding='utf-8'); assert data == '# Command Backed Fixture\\n\\nTask: task-command-backed\\n'; print('validated command-backed fixture')"
+          ],
+          "timeout_sec": 5
+        }
+      ],
+      "validation_command_allowlist": [
+        [
+          "python3",
+          "-c",
+          "from pathlib import Path; data=Path('agent-loop-results/command-backed-fixture.md').read_text(encoding='utf-8'); assert data == '# Command Backed Fixture\\n\\nTask: task-command-backed\\n'; print('validated command-backed fixture')"
+        ]
+      ]
+    }
+  ]
+}
+JSON
+
+python3 scripts/local_program_loop_v0.py run-program \
+  --program "$adapter_tmp/program.json" \
+  --queue "$adapter_tmp/queue.json" \
+  --artifacts "$adapter_tmp/artifacts" \
+  --min-open 1 \
+  --roadmap-timeout-sec 60 \
+  --max-retries 2 \
+  --execution-mode worktree \
+  --worktree-repo "$target_repo" \
+  --worktrees-dir "$adapter_tmp/worktrees" \
+  --worktree-base-ref main
+
+python3 scripts/local_program_loop_v0.py validate \
+  --program "$adapter_tmp/program.json" \
+  --queue "$adapter_tmp/queue.json" \
+  --artifacts "$adapter_tmp/artifacts" \
+  --check-artifacts
+```
 
 ## Review-Only and Dry Run
 
@@ -224,6 +358,21 @@ blocked until dependencies are satisfied or explicitly overridden.
 - Failed validation leaves the task `FAILED`, records diagnostics, and does not
   record a commit SHA.
 
+## Durable v0.5 Adapter Behavior
+
+- Worktree metadata records `action_adapter`, normalized `action_inputs`,
+  expected change paths, validation commands, command output artifact references,
+  timeout status, validation output, and commit SHA.
+- Command output artifacts are stable JSON files under
+  `<artifacts>/<task-id>/command-outputs/` and include captured stdout, stderr,
+  exit code, timeout status, argv, and artifact path.
+- Command-backed tasks require allowlisted validation command evidence before
+  local mutation.
+- Failed validation commands and timed-out commands produce `FAILED` task state,
+  keep the task branch uncommitted, and preserve diagnostics.
+- Reruns skip terminal tasks and do not duplicate branches, worktrees, commits,
+  task events, synthesized tasks, or command output artifacts.
+
 ## Expected Behavior
 
 - Program loop can generate additional near-term tasks from roadmap backlog.
@@ -245,11 +394,15 @@ For each processed task `<task_id>`, the worker writes:
 For each worktree-backed processed task, the worker also writes:
 
 - `worktree.json`
+- `command-outputs/*.json` when action or validation commands run
 
-`worktree.json` records branch name, worktree path, base ref, commit SHA when
-present, validation output, dirty status evidence, and final task state. Artifact
-integrity rejects `DONE` worktree tasks without a valid commit SHA and rejects
-`FAILED` worktree tasks that report a success commit.
+`worktree.json` records branch name, worktree path, base ref, action adapter,
+action inputs, expected change paths, validation commands, command output
+references, timeout status, commit SHA when present, validation output, dirty
+status evidence, and final task state. Artifact integrity rejects `DONE`
+worktree tasks without adapter metadata, validation command evidence for
+command-backed actions, command output artifacts, or a valid commit SHA. It also
+rejects `FAILED` worktree tasks that report a success commit.
 
 The program loop writes:
 
@@ -303,10 +456,14 @@ dirty worktree rejection, interrupted existing-commit recovery, rerun
 idempotency, missing worktree metadata detection, branch/worktree reuse,
 terminal artifact recovery, ambiguous branch rejection, task-id collision
 isolation, metadata tamper detection, and relative worktree-dir CLI handling.
+v0.5 adds adapter scenarios for command-backed success, validation command
+failure, command timeout, adapter reruns, missing command output artifacts,
+missing `DONE` metadata, unknown adapter rejection, ambiguous command rejection,
+missing validation evidence, and unsafe action path rejection.
 
 It exits non-zero if any assertion or checked-in fixture comparison fails.
 
-## Completion Gate for v0.4
+## Completion Gate for v0.5
 
 ```bash
 PYTHONPYCACHEPREFIX="$(mktemp -d)" python3 -m py_compile \
@@ -358,6 +515,97 @@ python3 scripts/local_program_loop_v0.py validate \
   --program "$worktree_tmp/program.json" \
   --queue "$worktree_tmp/queue.json" \
   --artifacts "$worktree_tmp/artifacts" \
+  --check-artifacts
+
+adapter_tmp="$(mktemp -d)"
+target_repo="$adapter_tmp/target-repo"
+mkdir -p "$target_repo"
+git -C "$target_repo" init
+git -C "$target_repo" config user.name "Local Agent Loop"
+git -C "$target_repo" config user.email "loop@example.invalid"
+printf '# Fixture Repository\n' > "$target_repo/README.md"
+git -C "$target_repo" add README.md
+git -C "$target_repo" commit -m "Initial fixture"
+git -C "$target_repo" branch -M main
+python3 - <<'PY' "$adapter_tmp/program.json" "$adapter_tmp/queue.json"
+import json
+import sys
+
+program_path, queue_path = sys.argv[1:3]
+path = "agent-loop-results/command-backed-fixture.md"
+content = "# Command Backed Fixture\n\nTask: task-command-backed\n"
+action = (
+    "from pathlib import Path; "
+    f"p=Path({path!r}); "
+    "p.parent.mkdir(parents=True, exist_ok=True); "
+    f"p.write_text({content!r}, encoding='utf-8')"
+)
+validation = (
+    "from pathlib import Path; "
+    f"data=Path({path!r}).read_text(encoding='utf-8'); "
+    f"assert data == {content!r}; "
+    "print('validated command-backed fixture')"
+)
+action_argv = ["python3", "-c", action]
+validation_argv = ["python3", "-c", validation]
+program = {
+    "schema_version": "local-agent-loop-v0.3",
+    "program_id": "adapter-smoke",
+    "goal": "Run a command-backed local action adapter",
+    "program_state": "IDLE",
+    "last_roadmap_review_ts": "2026-01-01T00:00:00+00:00",
+    "roadmap_backlog": [],
+    "review_log": [],
+}
+queue = {
+    "schema_version": "local-agent-loop-v0.3",
+    "tasks": [
+        {
+            "id": "task-command-backed",
+            "title": "Command-backed adapter smoke",
+            "state": "OPEN",
+            "retries": 0,
+            "required_checks": ["command-fixture"],
+            "local_action": {
+                "adapter": "command-backed-patch-fixture",
+                "inputs": {
+                    "name": "write-command-fixture",
+                    "command": action_argv,
+                    "allowed_commands": [action_argv],
+                    "timeout_sec": 5,
+                    "expected_path": path,
+                    "expected_content": content,
+                },
+            },
+            "validation_commands": [
+                {
+                    "name": "verify-command-fixture",
+                    "command": validation_argv,
+                    "timeout_sec": 5,
+                }
+            ],
+            "validation_command_allowlist": [validation_argv],
+        }
+    ],
+}
+open(program_path, "w", encoding="utf-8").write(json.dumps(program, indent=2) + "\n")
+open(queue_path, "w", encoding="utf-8").write(json.dumps(queue, indent=2) + "\n")
+PY
+python3 scripts/local_program_loop_v0.py run-program \
+  --program "$adapter_tmp/program.json" \
+  --queue "$adapter_tmp/queue.json" \
+  --artifacts "$adapter_tmp/artifacts" \
+  --min-open 1 \
+  --roadmap-timeout-sec 60 \
+  --max-retries 2 \
+  --execution-mode worktree \
+  --worktree-repo "$target_repo" \
+  --worktrees-dir "$adapter_tmp/worktrees" \
+  --worktree-base-ref main
+python3 scripts/local_program_loop_v0.py validate \
+  --program "$adapter_tmp/program.json" \
+  --queue "$adapter_tmp/queue.json" \
+  --artifacts "$adapter_tmp/artifacts" \
   --check-artifacts
 
 git diff --check
