@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import shutil
+import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -47,11 +49,38 @@ def read_json(path: Path) -> Any:
 def read_ndjson(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    events: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                events.append(json.loads(line))
+    return events
+
+
+def run_cmd(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        cwd=cwd,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def init_fixture_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    run_cmd(["git", "init"], cwd=path)
+    run_cmd(["git", "config", "user.name", "Local Agent Loop"], cwd=path)
+    run_cmd(["git", "config", "user.email", "loop@example.invalid"], cwd=path)
+    (path / "README.md").write_text("# Fixture Repository\n", encoding="utf-8")
+    run_cmd(["git", "add", "README.md"], cwd=path)
+    run_cmd(["git", "commit", "-m", "Initial fixture"], cwd=path)
+    run_cmd(["git", "branch", "-M", "main"], cwd=path)
+
+
+def git_stdout(repo: Path, args: list[str]) -> str:
+    return run_cmd(["git", *args], cwd=repo).stdout.strip()
 
 
 def program_doc(**fields: Any) -> dict[str, Any]:
@@ -60,6 +89,69 @@ def program_doc(**fields: Any) -> dict[str, Any]:
 
 def queue_doc(tasks: list[dict[str, Any]]) -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "tasks": tasks}
+
+
+def worktree_program_doc(program_id: str) -> dict[str, Any]:
+    return program_doc(
+        program_id=program_id,
+        goal="Execute a deterministic local worktree task",
+        program_state="IDLE",
+        last_roadmap_review_ts=local_program_loop_v0.utc_now(),
+        roadmap_backlog=[],
+        review_log=[],
+    )
+
+
+def worktree_task(task_id: str, **fields: Any) -> dict[str, Any]:
+    task = {
+        "id": task_id,
+        "title": f"Worktree task {task_id}",
+        "state": "OPEN",
+        "retries": 0,
+        "required_checks": ["fixture-change"],
+    }
+    task.update(fields)
+    return task
+
+
+def worktree_config(repo: Path, worktrees_dir: Path) -> local_agent_loop_v0.WorktreeConfig:
+    return local_agent_loop_v0.WorktreeConfig(
+        repo=repo,
+        worktrees_dir=worktrees_dir,
+        base_ref="main",
+        branch_prefix="codex/local-agent-loop",
+    )
+
+
+def worktree_branch(task_id: str, cfg: local_agent_loop_v0.WorktreeConfig) -> str:
+    return local_agent_loop_v0.worktree_branch_name(task_id, cfg)
+
+
+def worktree_path(task_id: str, cfg: local_agent_loop_v0.WorktreeConfig) -> Path:
+    return local_agent_loop_v0.worktree_path_for_task(task_id, cfg)
+
+
+def run_worktree_program(
+    tmp_dir: Path,
+    task: dict[str, Any],
+    repo: Path,
+    worktrees_dir: Path,
+) -> tuple[dict[str, Any], Path, Path, Path]:
+    program_file = tmp_dir / "program.json"
+    queue_file = tmp_dir / "queue.json"
+    artifacts = tmp_dir / "artifacts"
+    write_json(program_file, worktree_program_doc(f"program-{task['id']}"))
+    write_json(queue_file, queue_doc([task]))
+    local_program_loop_v0.run_program(
+        program_file=program_file,
+        queue_file=queue_file,
+        artifacts=artifacts,
+        min_open=1,
+        timeout_s=300,
+        max_retries=2,
+        worktree_config=worktree_config(repo, worktrees_dir),
+    )
+    return read_json(queue_file), program_file, queue_file, artifacts
 
 
 def iso_delta_seconds(start: str, end: str) -> float:
@@ -861,6 +953,568 @@ def scenario_artifact_integrity() -> dict[str, Any]:
         return result
 
 
+def scenario_worktree_success() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="worktree-success-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            worktree_task("task-worktree-success"),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        cfg = worktree_config(repo, worktrees)
+        branch = worktree_branch("task-worktree-success", cfg)
+        metadata = read_json(artifacts / "task-worktree-success/worktree.json")
+        validation = read_json(artifacts / "task-worktree-success/validation.json")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "task_state": task["state"],
+            "processed_by": task["processed_by"],
+            "commit_sha_valid": local_program_loop_v0.is_commit_sha(
+                task.get("worktree_commit_sha")
+            ),
+            "metadata_commit_matches_task": (
+                metadata["commit_sha"] == task.get("worktree_commit_sha")
+            ),
+            "validation_passed": validation["passed"],
+            "branch_exists": branch in git_stdout(repo, ["branch", "--list", branch]),
+            "commit_count_on_branch": int(git_stdout(repo, ["rev-list", "--count", branch])),
+            "change_file_exists": (
+                worktree_path("task-worktree-success", cfg)
+                / local_agent_loop_v0.worktree_change_path(task).as_posix()
+            ).exists(),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "DONE", "worktree task did not finish DONE")
+        require(result["processed_by"] == local_agent_loop_v0.WORKTREE_PROCESSED_BY, "wrong worker")
+        require(result["commit_sha_valid"], "DONE worktree task missing valid commit SHA")
+        require(result["metadata_commit_matches_task"], "metadata commit did not match task")
+        require(result["validation_passed"], "worktree validation failed")
+        require(result["branch_exists"], "worktree branch was not created")
+        require(result["commit_count_on_branch"] == 2, "worktree branch has wrong commit count")
+        require(result["change_file_exists"], "deterministic change file missing")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_worktree_validation_failure_no_commit() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="worktree-validation-fail-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            worktree_task("task-worktree-fail", simulate_worktree_validation_fail=True),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        cfg = worktree_config(repo, worktrees)
+        branch = worktree_branch("task-worktree-fail", cfg)
+        metadata = read_json(artifacts / "task-worktree-fail/worktree.json")
+        validation = read_json(artifacts / "task-worktree-fail/validation.json")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "task_state": task["state"],
+            "validation_passed": validation["passed"],
+            "commit_sha": task.get("worktree_commit_sha"),
+            "metadata_commit_sha": metadata["commit_sha"],
+            "branch_commit_count": int(git_stdout(repo, ["rev-list", "--count", branch])),
+            "dirty_after_detected": bool(metadata["dirty_status_after"]),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "FAILED", "failed validation task did not become FAILED")
+        require(not result["validation_passed"], "validation failure reported pass")
+        require(result["commit_sha"] is None, "FAILED task recorded a commit SHA")
+        require(result["metadata_commit_sha"] is None, "FAILED metadata recorded a commit SHA")
+        require(result["branch_commit_count"] == 1, "validation failure created a commit")
+        require(result["dirty_after_detected"], "failed validation did not preserve diagnostics")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_worktree_dirty_guard() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="worktree-dirty-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        cfg = worktree_config(repo, worktrees)
+        branch = worktree_branch("task-worktree-dirty", cfg)
+        path = worktree_path("task-worktree-dirty", cfg)
+        run_cmd(["git", "worktree", "add", "-b", branch, str(path), "main"], cwd=repo)
+        (path / "DIRTY.txt").write_text("uncommitted\n", encoding="utf-8")
+
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            worktree_task("task-worktree-dirty"),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        metadata = read_json(artifacts / "task-worktree-dirty/worktree.json")
+        validation = read_json(artifacts / "task-worktree-dirty/validation.json")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "task_state": task["state"],
+            "validation_message": validation["message"],
+            "commit_sha": task.get("worktree_commit_sha"),
+            "dirty_status_before_count": len(metadata["dirty_status_before"]),
+            "change_file_created": (
+                path / local_agent_loop_v0.worktree_change_path(task).as_posix()
+            ).exists(),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "FAILED", "dirty worktree was not rejected")
+        require("dirty before execution" in result["validation_message"], "dirty guard unclear")
+        require(result["commit_sha"] is None, "dirty guard recorded a commit")
+        require(result["dirty_status_before_count"] > 0, "dirty status was not recorded")
+        require(not result["change_file_created"], "dirty guard mutated the worktree")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_worktree_interrupted_existing_commit_recovery() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="worktree-existing-commit-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        state = tmp_dir / "state"
+        init_fixture_repo(repo)
+        program_file = state / "program.json"
+        queue_file = state / "queue.json"
+        artifacts = state / "artifacts"
+        write_json(program_file, worktree_program_doc("program-existing-commit"))
+        write_json(queue_file, queue_doc([worktree_task("task-worktree-recover")]))
+        cfg = worktree_config(repo, worktrees)
+
+        local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=1,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=cfg,
+        )
+        first_queue = read_json(queue_file)
+        first_commit = first_queue["tasks"][0]["worktree_commit_sha"]
+        shutil.rmtree(artifacts / "task-worktree-recover")
+        write_json(queue_file, queue_doc([worktree_task("task-worktree-recover")]))
+
+        local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=1,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=cfg,
+        )
+        queue_out = read_json(queue_file)
+        task = queue_out["tasks"][0]
+        metadata = read_json(artifacts / "task-worktree-recover/worktree.json")
+        branch = worktree_branch("task-worktree-recover", cfg)
+        result = {
+            "task_state": task["state"],
+            "same_commit_reused": task["worktree_commit_sha"] == first_commit,
+            "metadata_commit_reused": metadata["commit_reused"],
+            "branch_preexisted": metadata["branch_preexisted"],
+            "worktree_preexisted": metadata["worktree_preexisted"],
+            "commit_count_on_branch": int(git_stdout(repo, ["rev-list", "--count", branch])),
+        }
+        require(result["task_state"] == "DONE", "existing commit recovery did not finish DONE")
+        require(result["same_commit_reused"], "existing commit recovery created a new commit")
+        require(result["metadata_commit_reused"], "metadata did not report commit reuse")
+        require(result["branch_preexisted"], "recovery did not reuse existing branch")
+        require(result["worktree_preexisted"], "recovery did not reuse existing worktree")
+        require(result["commit_count_on_branch"] == 2, "existing commit recovery duplicated commit")
+        return result
+
+
+def scenario_worktree_rerun_idempotency() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="worktree-rerun-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        state = tmp_dir / "state"
+        init_fixture_repo(repo)
+        program_file = state / "program.json"
+        queue_file = state / "queue.json"
+        artifacts = state / "artifacts"
+        write_json(program_file, worktree_program_doc("program-rerun"))
+        write_json(queue_file, queue_doc([worktree_task("task-worktree-once")]))
+        cfg = worktree_config(repo, worktrees)
+
+        local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=1,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=cfg,
+        )
+        branch = worktree_branch("task-worktree-once", cfg)
+        commit_count_after_first = int(git_stdout(repo, ["rev-list", "--count", branch]))
+        events_after_first = read_ndjson(artifacts / "task-worktree-once/events.ndjson")
+        first_queue = read_json(queue_file)
+
+        local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=1,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=cfg,
+        )
+        commit_count_after_second = int(git_stdout(repo, ["rev-list", "--count", branch]))
+        events_after_second = read_ndjson(artifacts / "task-worktree-once/events.ndjson")
+        second_queue = read_json(queue_file)
+        task_ids = [task["id"] for task in second_queue["tasks"]]
+        first_commit_sha = first_queue["tasks"][0]["worktree_commit_sha"]
+        second_commit_sha = second_queue["tasks"][0]["worktree_commit_sha"]
+        result = {
+            "task_ids": task_ids,
+            "unique_task_id_count": len(set(task_ids)),
+            "commit_sha_valid": local_program_loop_v0.is_commit_sha(second_commit_sha),
+            "same_commit_sha": first_commit_sha == second_commit_sha,
+            "commit_count_after_first": commit_count_after_first,
+            "commit_count_after_second": commit_count_after_second,
+            "task_event_count_after_first": len(events_after_first),
+            "task_event_count_after_second": len(events_after_second),
+            "worktree_dir_count": len([path for path in worktrees.iterdir() if path.is_dir()]),
+        }
+        require(result["unique_task_id_count"] == len(task_ids), "rerun duplicated task ids")
+        require(result["commit_sha_valid"], "rerun task missing commit")
+        require(result["same_commit_sha"], "rerun changed commit")
+        require(
+            result["commit_count_after_second"] == result["commit_count_after_first"],
+            "rerun created duplicate commit",
+        )
+        require(
+            result["task_event_count_after_second"] == result["task_event_count_after_first"],
+            "rerun appended terminal task events",
+        )
+        require(result["worktree_dir_count"] == 1, "rerun created duplicate worktrees")
+        return result
+
+
+def scenario_worktree_missing_artifact_detection() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="worktree-missing-artifact-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            worktree_task("task-worktree-missing-artifact"),
+            repo,
+            worktrees,
+        )
+        (artifacts / "task-worktree-missing-artifact/worktree.json").unlink()
+        errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "error_count": len(errors),
+            "missing_worktree_metadata_detected": any("worktree.json" in err for err in errors),
+        }
+        require(result["error_count"] > 0, "missing worktree artifact passed integrity")
+        require(
+            result["missing_worktree_metadata_detected"],
+            "missing worktree metadata was not detected",
+        )
+        return result
+
+
+def scenario_worktree_branch_and_worktree_reuse() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="worktree-reuse-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        cfg = worktree_config(repo, worktrees)
+        branch = worktree_branch("task-worktree-reuse", cfg)
+        path = worktree_path("task-worktree-reuse", cfg)
+        run_cmd(["git", "worktree", "add", "-b", branch, str(path), "main"], cwd=repo)
+
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            worktree_task("task-worktree-reuse"),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        metadata = read_json(artifacts / "task-worktree-reuse/worktree.json")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "task_state": task["state"],
+            "branch_preexisted": metadata["branch_preexisted"],
+            "worktree_preexisted": metadata["worktree_preexisted"],
+            "commit_sha_valid": local_program_loop_v0.is_commit_sha(
+                task.get("worktree_commit_sha")
+            ),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "DONE", "preexisting worktree task did not finish")
+        require(result["branch_preexisted"], "preexisting branch was not reused")
+        require(result["worktree_preexisted"], "preexisting worktree was not reused")
+        require(result["commit_sha_valid"], "reuse scenario missing commit")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_worktree_terminal_artifact_recovery() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="worktree-terminal-artifact-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        state = tmp_dir / "state"
+        init_fixture_repo(repo)
+        program_file = state / "program.json"
+        queue_file = state / "queue.json"
+        artifacts = state / "artifacts"
+        write_json(program_file, worktree_program_doc("program-terminal-artifact"))
+        write_json(queue_file, queue_doc([worktree_task("task-worktree-terminal")]))
+        cfg = worktree_config(repo, worktrees)
+
+        local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=1,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=cfg,
+        )
+        first_queue = read_json(queue_file)
+        first_commit = first_queue["tasks"][0]["worktree_commit_sha"]
+        events_after_first = read_ndjson(artifacts / "task-worktree-terminal/events.ndjson")
+        write_json(queue_file, queue_doc([worktree_task("task-worktree-terminal")]))
+
+        local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=1,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=cfg,
+        )
+        queue_out = read_json(queue_file)
+        events_after_second = read_ndjson(artifacts / "task-worktree-terminal/events.ndjson")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "task_state": queue_out["tasks"][0]["state"],
+            "same_commit_recovered": queue_out["tasks"][0]["worktree_commit_sha"] == first_commit,
+            "event_count_after_first": len(events_after_first),
+            "event_count_after_second": len(events_after_second),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "DONE", "terminal artifact recovery did not finish DONE")
+        require(result["same_commit_recovered"], "terminal artifact recovery changed commit")
+        require(
+            result["event_count_after_second"] == result["event_count_after_first"],
+            "terminal artifact recovery appended duplicate events",
+        )
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_worktree_ambiguous_branch_rejected() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="worktree-ambiguous-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        cfg = worktree_config(repo, worktrees)
+        branch = worktree_branch("task-worktree-ambiguous", cfg)
+        path = worktree_path("task-worktree-ambiguous", cfg)
+        run_cmd(["git", "worktree", "add", "-b", branch, str(path), "main"], cwd=repo)
+        (path / "UNRELATED.md").write_text("unrelated\n", encoding="utf-8")
+        run_cmd(["git", "add", "UNRELATED.md"], cwd=path)
+        run_cmd(["git", "commit", "-m", "Unrelated task history"], cwd=path)
+
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            worktree_task("task-worktree-ambiguous"),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        validation = read_json(artifacts / "task-worktree-ambiguous/validation.json")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "task_state": task["state"],
+            "commit_sha": task.get("worktree_commit_sha"),
+            "validation_message": validation["message"],
+            "branch_commit_count": int(git_stdout(repo, ["rev-list", "--count", branch])),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "FAILED", "ambiguous branch was not rejected")
+        require(result["commit_sha"] is None, "ambiguous branch recorded a commit")
+        require(
+            "preexisting task branch" in result["validation_message"],
+            "ambiguous branch diagnostic was unclear",
+        )
+        require(result["branch_commit_count"] == 2, "ambiguous branch was mutated")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_worktree_task_id_collision_isolated() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="worktree-collision-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        state = tmp_dir / "state"
+        init_fixture_repo(repo)
+        program_file = state / "program.json"
+        queue_file = state / "queue.json"
+        artifacts = state / "artifacts"
+        tasks = [
+            worktree_task("task/a"),
+            worktree_task("task a"),
+        ]
+        write_json(program_file, worktree_program_doc("program-collision"))
+        write_json(queue_file, queue_doc(tasks))
+        cfg = worktree_config(repo, worktrees)
+        local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=2,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=cfg,
+        )
+        queue_out = read_json(queue_file)
+        branches = [task["worktree_branch"] for task in queue_out["tasks"]]
+        paths = [task["worktree_path"] for task in queue_out["tasks"]]
+        commits = [task["worktree_commit_sha"] for task in queue_out["tasks"]]
+        result = {
+            "states": [task["state"] for task in queue_out["tasks"]],
+            "unique_branch_count": len(set(branches)),
+            "unique_worktree_path_count": len(set(paths)),
+            "commit_sha_count": sum(local_program_loop_v0.is_commit_sha(commit) for commit in commits),
+        }
+        require(result["states"] == ["DONE", "DONE"], "collision tasks did not complete")
+        require(result["unique_branch_count"] == 2, "collision tasks shared a branch")
+        require(result["unique_worktree_path_count"] == 2, "collision tasks shared a worktree")
+        require(result["commit_sha_count"] == 2, "collision tasks missing commits")
+        return result
+
+
+def scenario_worktree_metadata_tamper_detection() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="worktree-metadata-tamper-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            worktree_task("task-worktree-tamper"),
+            repo,
+            worktrees,
+        )
+        metadata_path = artifacts / "task-worktree-tamper/worktree.json"
+        metadata = read_json(metadata_path)
+        metadata["branch_name"] = "codex/local-agent-loop/wrong"
+        metadata["worktree_path"] = str(tmp_dir / "wrong-worktree")
+        write_json(metadata_path, metadata)
+        errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "error_count": len(errors),
+            "branch_mismatch_detected": any("branch_name mismatch" in err for err in errors),
+            "path_mismatch_detected": any("worktree_path mismatch" in err for err in errors),
+        }
+        require(result["error_count"] > 0, "tampered worktree metadata passed")
+        require(result["branch_mismatch_detected"], "branch tamper was not detected")
+        require(result["path_mismatch_detected"], "path tamper was not detected")
+        return result
+
+
+def scenario_worktree_relative_dir_cli() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="worktree-relative-cli-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        init_fixture_repo(repo)
+        program_file = tmp_dir / "program.json"
+        queue_file = tmp_dir / "queue.json"
+        artifacts = tmp_dir / "artifacts"
+        write_json(program_file, worktree_program_doc("program-relative-cli"))
+        write_json(queue_file, queue_doc([worktree_task("task-worktree-relative")]))
+        run_cmd(
+            [
+                "python3",
+                str(ROOT / "scripts/local_program_loop_v0.py"),
+                "run-program",
+                "--program",
+                str(program_file),
+                "--queue",
+                str(queue_file),
+                "--artifacts",
+                str(artifacts),
+                "--execution-mode",
+                "worktree",
+                "--worktree-repo",
+                "repo",
+                "--worktrees-dir",
+                ".worktrees",
+                "--worktree-base-ref",
+                "main",
+            ],
+            cwd=tmp_dir,
+        )
+        queue_out = read_json(queue_file)
+        result = {
+            "task_state": queue_out["tasks"][0]["state"],
+            "relative_worktree_root_created": (tmp_dir / ".worktrees").is_dir(),
+            "worktree_path_is_absolute": Path(queue_out["tasks"][0]["worktree_path"]).is_absolute(),
+        }
+        require(result["task_state"] == "DONE", "relative worktrees-dir CLI run failed")
+        require(result["relative_worktree_root_created"], "relative worktree dir was not resolved")
+        require(result["worktree_path_is_absolute"], "recorded worktree path was not absolute")
+        return result
+
+
 def scenario_determinism() -> dict[str, Any]:
     orders = []
     for _ in range(20):
@@ -894,6 +1548,20 @@ def build_summary() -> dict[str, Any]:
         "dry_run_behavior": scenario_dry_run_behavior,
         "rerun_idempotency": scenario_rerun_idempotency,
         "artifact_integrity": scenario_artifact_integrity,
+        "worktree_success": scenario_worktree_success,
+        "worktree_validation_failure_no_commit": scenario_worktree_validation_failure_no_commit,
+        "worktree_dirty_guard": scenario_worktree_dirty_guard,
+        "worktree_interrupted_existing_commit_recovery": (
+            scenario_worktree_interrupted_existing_commit_recovery
+        ),
+        "worktree_rerun_idempotency": scenario_worktree_rerun_idempotency,
+        "worktree_missing_artifact_detection": scenario_worktree_missing_artifact_detection,
+        "worktree_branch_and_worktree_reuse": scenario_worktree_branch_and_worktree_reuse,
+        "worktree_terminal_artifact_recovery": scenario_worktree_terminal_artifact_recovery,
+        "worktree_ambiguous_branch_rejected": scenario_worktree_ambiguous_branch_rejected,
+        "worktree_task_id_collision_isolated": scenario_worktree_task_id_collision_isolated,
+        "worktree_metadata_tamper_detection": scenario_worktree_metadata_tamper_detection,
+        "worktree_relative_dir_cli": scenario_worktree_relative_dir_cli,
         "deterministic_scheduling_20_runs": scenario_determinism,
     }
     results = {name: fn() for name, fn in scenarios.items()}
