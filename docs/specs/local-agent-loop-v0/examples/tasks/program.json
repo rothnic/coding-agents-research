@@ -1,0 +1,22 @@
+{
+  "program_id": "roadmap-001",
+  "goal": "Continuously maintain a healthy near-term task queue",
+  "last_roadmap_review_ts": "2026-05-13T20:35:56.639769+00:00",
+  "roadmap_backlog": [
+    {
+      "id": "task-003",
+      "title": "Improve test coverage for queue claims"
+    }
+  ],
+  "review_log": [
+    {
+      "ts": "2026-05-13T20:35:56.639769+00:00",
+      "reason": {
+        "open_below_threshold": false,
+        "no_unblocked_tasks": false,
+        "timeout_elapsed": true
+      },
+      "generated_tasks": 1
+    }
+  ]
+}

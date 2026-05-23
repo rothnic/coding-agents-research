@@ -1,0 +1,26 @@
+{
+  "tasks": [
+    {
+      "id": "task-001",
+      "title": "Demonstrate loop with retry",
+      "state": "DONE",
+      "retries": 1,
+      "simulate_validation_fail_once": true,
+      "required_checks": [
+        "test",
+        "lint"
+      ],
+      "_failed_once": true
+    },
+    {
+      "id": "task-002",
+      "title": "Implement parser hardening",
+      "state": "DONE",
+      "retries": 0,
+      "required_checks": [
+        "test",
+        "lint"
+      ]
+    }
+  ]
+}
