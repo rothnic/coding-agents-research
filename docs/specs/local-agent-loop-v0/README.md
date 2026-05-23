@@ -42,66 +42,148 @@ Retry path:
 
 `VALIDATING -> EXECUTING -> VALIDATING` (bounded by `max_retries`)
 
+## CLI Surface
+
+The operator entrypoint is `scripts/local_program_loop_v0.py`:
+
+- `validate` checks program and queue schema before any mutation.
+- `run-worker` executes only the task worker loop.
+- `run-program` validates inputs, runs roadmap review, hands off to the worker,
+  writes program artifacts, and verifies artifact integrity.
+- `status` prints a compact JSON status snapshot and optional artifact errors.
+
+The worker script still supports direct task execution through
+`scripts/local_agent_loop_v0.py`, but the program CLI is the preferred v0.3
+surface because it validates both files and checks program-level artifacts.
+
 ## Run Worker Loop Only
 
 ```bash
 tmp_dir="$(mktemp -d)"
 cp docs/specs/local-agent-loop-v0/examples/tasks/queue.json "$tmp_dir/queue.json"
 
-python3 scripts/local_agent_loop_v0.py \
+python3 scripts/local_program_loop_v0.py run-worker \
   --queue "$tmp_dir/queue.json" \
   --artifacts "$tmp_dir/artifacts" \
   --max-retries 2
 ```
 
-## Run Composed Program + Worker Workflow
+## Validate, Execute, and Verify
+
+This single command validates input schemas, runs the composed workflow, and
+fails if required program or processed-task artifacts are missing or inconsistent:
 
 ```bash
 tmp_dir="$(mktemp -d)"
 cp docs/specs/local-agent-loop-v0/examples/tasks/program.json "$tmp_dir/program.json"
 cp docs/specs/local-agent-loop-v0/examples/tasks/queue.json "$tmp_dir/queue.json"
 
-python3 scripts/local_program_loop_v0.py \
+python3 scripts/local_program_loop_v0.py run-program \
   --program "$tmp_dir/program.json" \
   --queue "$tmp_dir/queue.json" \
   --artifacts "$tmp_dir/artifacts" \
   --min-open 2 \
   --roadmap-timeout-sec 60 \
   --max-retries 2
-
-ls "$tmp_dir/artifacts"
 ```
 
-## Run v0.2 Regression Harness
+Inspect the final state:
 
 ```bash
-python3 scripts/test_local_agent_loop_v0.py
+python3 scripts/local_program_loop_v0.py status \
+  --program "$tmp_dir/program.json" \
+  --queue "$tmp_dir/queue.json" \
+  --artifacts "$tmp_dir/artifacts"
 ```
 
-The harness runs canonical CLI-level scenarios for backlog refill, all tasks blocked,
-dependency-unblock partial success, validation fail-then-retry, illegal
-transition injection, persisted transition enforcement, null optional field
-handling, null backlog reporting, and 20 repeated deterministic scheduling runs.
-It exits non-zero if any assertion or checked-in fixture comparison fails.
+## Review-Only and Dry Run
+
+Review-only mutates temp copies by running roadmap review and reporting without
+invoking the worker:
+
+```bash
+tmp_dir="$(mktemp -d)"
+cp docs/specs/local-agent-loop-v0/examples/tasks/program.json "$tmp_dir/program.json"
+cp docs/specs/local-agent-loop-v0/examples/tasks/queue.json "$tmp_dir/queue.json"
+
+python3 scripts/local_program_loop_v0.py run-program \
+  --program "$tmp_dir/program.json" \
+  --queue "$tmp_dir/queue.json" \
+  --artifacts "$tmp_dir/artifacts" \
+  --review-only
+```
+
+Dry run validates and reports the review plan without writing queue, program, or
+artifact files:
+
+```bash
+tmp_dir="$(mktemp -d)"
+cp docs/specs/local-agent-loop-v0/examples/tasks/program.json "$tmp_dir/program.json"
+cp docs/specs/local-agent-loop-v0/examples/tasks/queue.json "$tmp_dir/queue.json"
+
+python3 scripts/local_program_loop_v0.py run-program \
+  --program "$tmp_dir/program.json" \
+  --queue "$tmp_dir/queue.json" \
+  --artifacts "$tmp_dir/artifacts-dry-run" \
+  --dry-run
+```
+
+## Schema Contract
+
+`program.json` and `queue.json` must declare:
+
+```json
+{
+  "schema_version": "local-agent-loop-v0.3"
+}
+```
+
+Validation fails before mutation for malformed JSON, unsupported schema versions,
+duplicate task or backlog ids, invalid task or program states, malformed
+dependency lists, self-dependencies, invalid retry counts, and invalid ISO
+timestamps. Missing dependency targets are allowed because blocked work may be
+waiting on external or future tasks; the unblocking policy keeps those tasks
+blocked until dependencies are satisfied or explicitly overridden.
+
+## Durable v0.3 Behavior
+
+- Reruns skip terminal tasks and do not append duplicate task events.
+- Task synthesis removes backlog items whose ids already exist in the queue,
+  preventing duplicate generated tasks after interrupted runs.
+- Persisted non-`IDLE` program states are recovered to `IDLE` with a
+  `PROGRAM_STATE_RECOVERY` event before the next review begins.
+- Invalid inputs fail fast before queue, program, or artifact files are mutated.
+- Program events and task events are append-only NDJSON streams.
+- Processed `DONE` and `FAILED` tasks are marked with `processed_by` and
+  `processed_ts`; artifact integrity checks apply to those processed tasks.
 
 ## Expected Behavior
 
 - Program loop can generate additional near-term tasks from roadmap backlog.
 - Program loop can reopen blocked work when dependencies are satisfied.
 - Program loop leaves blocked work blocked when dependencies are missing or unmet.
-- Worker loop processes runnable tasks and writes per-task artifacts.
+- Worker loop resumes partially completed active tasks and writes per-task artifacts.
+- Re-running the composed workflow on the same completed inputs does not duplicate
+  generated tasks or corrupt task event logs.
 
 ## Artifact Contract
 
-For each task `<task_id>`, the worker writes:
+For each processed task `<task_id>`, the worker writes:
 
 - `plan.md`
 - `events.ndjson`
 - `validation.json`
 - `result.md`
 
-All files are local and require no cloud services.
+The program loop writes:
 
+- `roadmap_events.ndjson`
+- `roadmap_status.md`
+- `program_metrics.json`
+
+`program_metrics.json` must match the final queue and program state for counts,
+program id, program state, backlog count, review log count, and schema version.
+All files are local and require no cloud services.
 
 ## Program Review Log Fields
 
@@ -115,18 +197,6 @@ Each roadmap review appends an entry in `program.json.review_log` with:
 - `unblock_decisions`
 - `reopened_task_ids`
 
-
-## Program-Level Artifacts
-
-The program loop now also writes a higher-level event stream:
-
-- `roadmap_events.ndjson` (under the same artifacts root)
-- `roadmap_status.md`
-- `program_metrics.json`
-
-Each program event includes `from_program_state` and `to_program_state` for
-auditing high-level planning/replanning behavior.
-
 ## Unblocking Policy
 
 When no unblocked tasks exist, the program loop reviews every blocked task,
@@ -137,113 +207,48 @@ reopens each dependency-ready task, and records the policy used:
 - `missing_dependency` -> `create_dependency_task_and_reopen`
 - fallback -> `manual_review_then_reopen`
 
-Blocked tasks now also support `depends_on: ["task-id"]`. A blocked task is only
-reopened when every dependency is `DONE`, unless the task explicitly sets
+Blocked tasks support `depends_on: ["task-id"]`. A blocked task is only reopened
+when every dependency is `DONE`, unless the task explicitly sets
 `dependency_override` or `override_dependencies`.
 
-## v0.2 Functionality with Discrete Success Criteria
-
-This increment is implemented and covered by `python3 scripts/test_local_agent_loop_v0.py`.
-
-### 1) Dependency-Aware Unblocking Graph
-
-**Implemented**
-- Represent task dependencies explicitly (`depends_on: [task-id...]`).
-- Prevent reopening blocked tasks unless dependencies are resolved or explicitly overridden.
-- Add blocked-cause normalization (`blocked_reason_code`) and a deterministic unblock action matrix.
-
-**Success criteria**
-- Given a queue with 3 blocked tasks and different dependency chains, the program loop:
-  - reopens only tasks whose prerequisites are `DONE`,
-  - leaves unresolved tasks blocked,
-  - emits one unblock decision event per reviewed blocked task.
-- `roadmap_events.ndjson` includes `dependency_check: pass|fail` for each unblock attempt.
-
-**Measurable checks**
-- `>= 1` and `<= N` tasks reopened exactly as predicted by dependency graph fixture.
-- `0` reopened tasks with unmet dependencies (strict).
-
-### 2) Program State Machine + Transition Guardrails
-
-**Implemented**
-- Introduce explicit program states:
-  - `ROADMAP_REVIEWING`, `TASK_SYNTHESIZING`, `UNBLOCKING`, `HANDING_OFF`, `IDLE`.
-- Enforce legal transitions and record transition failures as events.
-
-**Success criteria**
-- Every program-loop run records at least one program-state transition.
-- Illegal transition injection test is rejected and logged with reason.
-
-**Measurable checks**
-- `100%` of program events include `from_program_state` + `to_program_state`.
-- `0` silent transition failures.
-
-### 3) Priority and Scheduling Policy
-
-**Implemented**
-- Add `priority` and optional `deadline_ts` to roadmap backlog items.
-- Generate near-term tasks by deterministic ordering (priority desc, earliest
-  deadline, FIFO tie-break).
-
-**Success criteria**
-- In a mixed-priority fixture, generated tasks are always emitted in expected order.
-- Repeated runs with identical input produce identical generated order.
-
-**Measurable checks**
-- Ordering test pass rate: `100%` across at least 20 repeated runs.
-- Determinism mismatch count: `0`.
-
-### 4) High-Level Outcome Reporting
-
-**Implemented**
-- New artifact: `roadmap_status.md` summarizing objective progress, blockers, and next 3 tasks.
-- Add compact JSON snapshot `program_metrics.json` with counts and rates.
-
-**Success criteria**
-- After each composed run, both artifacts are updated once.
-- Metrics include: `open_count`, `blocked_count`, `unblocked_count`,
-  `generated_count`, `done_count`, `failed_count`.
-
-**Measurable checks**
-- Artifact freshness: timestamp delta between run start and artifact write `< 5s`.
-- Missing required metric fields: `0`.
-
-### 5) Regression Test Harness (CLI-Level)
-
-**Implemented**
-- Add a lightweight local test script that executes canonical scenarios:
-  - backlog refill,
-  - all tasks blocked,
-  - dependency-unblock partial success,
-  - validation fail then retry.
-
-**Success criteria**
-- All scenarios run via one command and return non-zero on any assertion failure.
-- Outputs are diff-stable against checked-in fixtures.
-
-**Measurable checks**
-- Scenario pass count = total scenario count.
-- Fixture diff violations: `0`.
-
-## Definition of Done for v0.2
-
-v0.2 is complete only when:
-- all five functionality areas above are implemented,
-- all measurable checks pass in local repeated runs,
-- README examples are updated and reproducible from clean checkout,
-- at least one end-to-end run demonstrates:
-  - roadmap review,
-  - deterministic task synthesis,
-  - dependency-aware unblocking,
-  - worker execution,
-  - auditable program + task artifacts.
-
-Completion gate:
+## Regression Harness
 
 ```bash
-python3 -m py_compile \
+python3 scripts/test_local_agent_loop_v0.py
+```
+
+The harness includes v0.2 behavior scenarios for backlog refill, all tasks
+blocked, dependency-unblock partial success, validation retry, illegal transition
+guarding, and deterministic scheduling. It also includes v0.3 scenarios for
+malformed input, duplicate ids, interrupted run recovery, rerun idempotency,
+dry-run behavior, schema version mismatch, and artifact integrity.
+
+It exits non-zero if any assertion or checked-in fixture comparison fails.
+
+## Completion Gate for v0.3
+
+```bash
+PYTHONPYCACHEPREFIX="$(mktemp -d)" python3 -m py_compile \
   scripts/local_agent_loop_v0.py \
   scripts/local_program_loop_v0.py \
   scripts/test_local_agent_loop_v0.py
-python3 scripts/test_local_agent_loop_v0.py
+
+PYTHONPYCACHEPREFIX="$(mktemp -d)" python3 scripts/test_local_agent_loop_v0.py
+
+tmp_dir="$(mktemp -d)"
+cp docs/specs/local-agent-loop-v0/examples/tasks/program.json "$tmp_dir/program.json"
+cp docs/specs/local-agent-loop-v0/examples/tasks/queue.json "$tmp_dir/queue.json"
+python3 scripts/local_program_loop_v0.py run-program \
+  --program "$tmp_dir/program.json" \
+  --queue "$tmp_dir/queue.json" \
+  --artifacts "$tmp_dir/artifacts" \
+  --min-open 2 \
+  --roadmap-timeout-sec 60 \
+  --max-retries 2
+python3 scripts/local_program_loop_v0.py status \
+  --program "$tmp_dir/program.json" \
+  --queue "$tmp_dir/queue.json" \
+  --artifacts "$tmp_dir/artifacts"
+
+git diff --check
 ```

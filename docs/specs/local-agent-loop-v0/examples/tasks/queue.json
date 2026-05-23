@@ -1,4 +1,5 @@
 {
+  "schema_version": "local-agent-loop-v0.3",
   "tasks": [
     {
       "id": "task-001",
