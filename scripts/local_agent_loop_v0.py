@@ -90,6 +90,8 @@ def run_git(cwd: Path, args: list[str], check: bool = True) -> GitResult:
         command,
         check=False,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -605,6 +607,7 @@ def commit_worktree_change(
     worktree_path: Path,
     change_path: Path,
     base_sha: str,
+    preexisting_commit_sha: str | None = None,
 ) -> tuple[str, bool, GitResult | None]:
     status = git_status_lines(worktree_path)
     if status:
@@ -622,6 +625,12 @@ def commit_worktree_change(
         raise WorktreeExecutionError(
             "deterministic change produced no diff and no existing task commit"
         )
+    if preexisting_commit_sha is not None:
+        if head_sha != preexisting_commit_sha:
+            raise WorktreeExecutionError(
+                "preexisting task commit changed before commit finalization"
+            )
+        return head_sha, True, None
     verify_recoverable_task_commit(task, worktree_path, base_sha)
     return head_sha, True, None
 
@@ -722,7 +731,11 @@ def execute_worktree_task(
                 )
                 transition(task, "FAILED", "Dirty worktree guard failed", events_file)
             else:
-                verify_recoverable_task_commit(task, worktree_path, ensured["base_sha"])
+                preexisting_commit_sha = verify_recoverable_task_commit(
+                    task,
+                    worktree_path,
+                    ensured["base_sha"],
+                )
                 change_path, expected_content = apply_worktree_change(task, worktree_path)
                 metadata["change_path"] = change_path.as_posix()
                 validation_result = validate_worktree_change(
@@ -740,6 +753,7 @@ def execute_worktree_task(
                             worktree_path,
                             change_path,
                             ensured["base_sha"],
+                            preexisting_commit_sha,
                         )
                     except WorktreeExecutionError as exc:
                         record_worktree_validation_failure(
