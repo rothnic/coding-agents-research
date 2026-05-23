@@ -680,18 +680,19 @@ def read_ndjson(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     events: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValidationError(
-                f"{path}:{line_number}: invalid NDJSON event: {exc.msg}"
-            ) from exc
-        if not isinstance(event, dict):
-            raise ValidationError(f"{path}:{line_number}: expected event object")
-        events.append(event)
+    with path.open(encoding="utf-8") as fh:
+        for line_number, line in enumerate(fh, start=1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValidationError(
+                    f"{path}:{line_number}: invalid NDJSON event: {exc.msg}"
+                ) from exc
+            if not isinstance(event, dict):
+                raise ValidationError(f"{path}:{line_number}: expected event object")
+            events.append(event)
     return events
 
 
