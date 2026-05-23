@@ -1,0 +1,49 @@
+{
+  "tasks": [
+    {
+      "id": "task-001",
+      "title": "Demonstrate loop with retry",
+      "state": "DONE",
+      "retries": 1,
+      "simulate_validation_fail_once": true,
+      "required_checks": [
+        "test",
+        "lint"
+      ],
+      "_failed_once": true
+    },
+    {
+      "id": "task-blocked-001",
+      "title": "Blocked dependency demonstration",
+      "state": "DONE",
+      "retries": 0,
+      "required_checks": [
+        "test",
+        "lint"
+      ],
+      "blocked_reason": "missing_dependency",
+      "unblocked_by": "program-loop",
+      "unblock_policy": "create_dependency_task_and_reopen"
+    },
+    {
+      "id": "task-002",
+      "title": "Implement parser hardening",
+      "state": "DONE",
+      "retries": 0,
+      "required_checks": [
+        "test",
+        "lint"
+      ]
+    },
+    {
+      "id": "task-003",
+      "title": "Improve test coverage for queue claims",
+      "state": "DONE",
+      "retries": 0,
+      "required_checks": [
+        "test",
+        "lint"
+      ]
+    }
+  ]
+}
