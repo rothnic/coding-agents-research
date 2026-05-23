@@ -1,0 +1,7 @@
+{"ts": "2026-05-13T20:35:56.640926+00:00", "task_id": "task-001", "from_state": "OPEN", "to_state": "CLAIMED", "actor": "loop-runner", "reason": "Worker claimed task"}
+{"ts": "2026-05-13T20:35:56.641261+00:00", "task_id": "task-001", "from_state": "CLAIMED", "to_state": "PLANNED", "actor": "loop-runner", "reason": "Plan created"}
+{"ts": "2026-05-13T20:35:56.641721+00:00", "task_id": "task-001", "from_state": "PLANNED", "to_state": "EXECUTING", "actor": "loop-runner", "reason": "Execution started"}
+{"ts": "2026-05-13T20:35:56.641797+00:00", "task_id": "task-001", "from_state": "EXECUTING", "to_state": "VALIDATING", "actor": "loop-runner", "reason": "Execution finished; entering validation"}
+{"ts": "2026-05-13T20:35:56.642289+00:00", "task_id": "task-001", "from_state": "VALIDATING", "to_state": "EXECUTING", "actor": "loop-runner", "reason": "Validation failed; retry 1"}
+{"ts": "2026-05-13T20:35:56.642435+00:00", "task_id": "task-001", "from_state": "EXECUTING", "to_state": "VALIDATING", "actor": "loop-runner", "reason": "Retry execution finished; re-validating"}
+{"ts": "2026-05-13T20:35:56.642833+00:00", "task_id": "task-001", "from_state": "VALIDATING", "to_state": "DONE", "actor": "loop-runner", "reason": "Validation passed after retry"}
