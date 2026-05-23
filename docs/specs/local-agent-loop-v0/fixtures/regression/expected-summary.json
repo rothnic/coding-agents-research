@@ -1,6 +1,6 @@
 {
-  "scenario_count": 7,
-  "scenario_pass_count": 7,
+  "scenario_count": 9,
+  "scenario_pass_count": 9,
   "scenarios": {
     "all_tasks_blocked": {
       "all_program_events_have_state_fields": true,
@@ -398,6 +398,210 @@
         }
       ],
       "program_state_after": "IDLE"
+    },
+    "null_backlog_reporting": {
+      "all_program_events_have_state_fields": true,
+      "blocked_count": 0,
+      "done_count": 1,
+      "failed_count": 0,
+      "generated_count": 0,
+      "generated_order": [],
+      "metric_fields_present": true,
+      "metrics_fresh_under_5s": true,
+      "program_events": [
+        {
+          "accepted": true,
+          "from_program_state": "IDLE",
+          "reason": "Evaluate roadmap review triggers",
+          "to_program_state": "ROADMAP_REVIEWING",
+          "type": "PROGRAM_STATE_TRANSITION"
+        },
+        {
+          "accepted": true,
+          "from_program_state": "ROADMAP_REVIEWING",
+          "reason": "Roadmap review requires task synthesis",
+          "to_program_state": "TASK_SYNTHESIZING",
+          "type": "PROGRAM_STATE_TRANSITION"
+        },
+        {
+          "from_program_state": "TASK_SYNTHESIZING",
+          "generated_task_ids": [],
+          "to_program_state": "TASK_SYNTHESIZING",
+          "type": "TASK_SYNTHESIS"
+        },
+        {
+          "accepted": true,
+          "from_program_state": "TASK_SYNTHESIZING",
+          "reason": "No unblocked tasks are available",
+          "to_program_state": "UNBLOCKING",
+          "type": "PROGRAM_STATE_TRANSITION"
+        },
+        {
+          "from_program_state": "UNBLOCKING",
+          "to_program_state": "UNBLOCKING",
+          "type": "ROADMAP_REVIEW"
+        },
+        {
+          "accepted": true,
+          "from_program_state": "UNBLOCKING",
+          "reason": "Unblocking review complete",
+          "to_program_state": "HANDING_OFF",
+          "type": "PROGRAM_STATE_TRANSITION"
+        },
+        {
+          "accepted": true,
+          "from_program_state": "HANDING_OFF",
+          "reason": "Worker loop complete",
+          "to_program_state": "IDLE",
+          "type": "PROGRAM_STATE_TRANSITION"
+        }
+      ],
+      "program_state": "IDLE",
+      "queue_states": {
+        "task-already-done": "DONE"
+      },
+      "reopened_task_ids": [],
+      "state_transition_count": 5,
+      "status_sections_present": [
+        true,
+        true,
+        true
+      ],
+      "task_artifacts": [],
+      "unblock_decisions": []
+    },
+    "null_field_hardening": {
+      "all_program_events_have_state_fields": true,
+      "blocked_count": 1,
+      "done_count": 2,
+      "failed_count": 0,
+      "generated_count": 1,
+      "generated_order": [
+        "task-null-backlog"
+      ],
+      "metric_fields_present": true,
+      "metrics_fresh_under_5s": true,
+      "program_events": [
+        {
+          "accepted": true,
+          "from_program_state": "IDLE",
+          "reason": "Evaluate roadmap review triggers",
+          "to_program_state": "ROADMAP_REVIEWING",
+          "type": "PROGRAM_STATE_TRANSITION"
+        },
+        {
+          "accepted": true,
+          "from_program_state": "ROADMAP_REVIEWING",
+          "reason": "Roadmap review requires task synthesis",
+          "to_program_state": "TASK_SYNTHESIZING",
+          "type": "PROGRAM_STATE_TRANSITION"
+        },
+        {
+          "from_program_state": "TASK_SYNTHESIZING",
+          "generated_task_ids": [
+            "task-null-backlog"
+          ],
+          "to_program_state": "TASK_SYNTHESIZING",
+          "type": "TASK_SYNTHESIS"
+        },
+        {
+          "accepted": true,
+          "from_program_state": "TASK_SYNTHESIZING",
+          "reason": "No unblocked tasks are available",
+          "to_program_state": "UNBLOCKING",
+          "type": "PROGRAM_STATE_TRANSITION"
+        },
+        {
+          "decision": {
+            "action": "manual_review_then_reopen",
+            "blocked_reason_code": "default",
+            "dependency_check": "pass",
+            "missing_dependencies": [],
+            "reopened": true,
+            "task_id": "task-null-deps",
+            "unmet_dependencies": []
+          },
+          "from_program_state": "UNBLOCKING",
+          "to_program_state": "UNBLOCKING",
+          "type": "UNBLOCK_DECISION"
+        },
+        {
+          "decision": {
+            "action": "wait_for_dependency_completion",
+            "blocked_reason_code": "waiting_on_external",
+            "dependency_check": "fail",
+            "missing_dependencies": [
+              "task-missing-null"
+            ],
+            "reopened": false,
+            "task_id": "task-null-blocked",
+            "unmet_dependencies": []
+          },
+          "from_program_state": "UNBLOCKING",
+          "to_program_state": "UNBLOCKING",
+          "type": "UNBLOCK_DECISION"
+        },
+        {
+          "from_program_state": "UNBLOCKING",
+          "to_program_state": "UNBLOCKING",
+          "type": "ROADMAP_REVIEW"
+        },
+        {
+          "accepted": true,
+          "from_program_state": "UNBLOCKING",
+          "reason": "Unblocking review complete",
+          "to_program_state": "HANDING_OFF",
+          "type": "PROGRAM_STATE_TRANSITION"
+        },
+        {
+          "accepted": true,
+          "from_program_state": "HANDING_OFF",
+          "reason": "Worker loop complete",
+          "to_program_state": "IDLE",
+          "type": "PROGRAM_STATE_TRANSITION"
+        }
+      ],
+      "program_state": "IDLE",
+      "queue_states": {
+        "task-null-backlog": "DONE",
+        "task-null-blocked": "BLOCKED",
+        "task-null-deps": "DONE"
+      },
+      "reopened_task_ids": [
+        "task-null-deps"
+      ],
+      "state_transition_count": 5,
+      "status_sections_present": [
+        true,
+        true,
+        true
+      ],
+      "task_artifacts": [
+        "task-null-backlog",
+        "task-null-deps"
+      ],
+      "unblock_decisions": [
+        {
+          "action": "manual_review_then_reopen",
+          "blocked_reason_code": "default",
+          "dependency_check": "pass",
+          "missing_dependencies": [],
+          "reopened": true,
+          "task_id": "task-null-deps",
+          "unmet_dependencies": []
+        },
+        {
+          "action": "wait_for_dependency_completion",
+          "blocked_reason_code": "waiting_on_external",
+          "dependency_check": "fail",
+          "missing_dependencies": [
+            "task-missing-null"
+          ],
+          "reopened": false,
+          "task_id": "task-null-blocked",
+          "unmet_dependencies": []
+        }
+      ]
     },
     "validation_fail_then_retry": {
       "event_transitions": [

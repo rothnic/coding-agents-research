@@ -52,7 +52,10 @@ def read_ndjson(path: Path) -> list[dict[str, Any]]:
 
 
 def iso_delta_seconds(start: str, end: str) -> float:
-    return (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds()
+    return (
+        datetime.fromisoformat(end.replace("Z", "+00:00"))
+        - datetime.fromisoformat(start.replace("Z", "+00:00"))
+    ).total_seconds()
 
 
 def stable_decision(decision: dict[str, Any]) -> dict[str, Any]:
@@ -450,6 +453,91 @@ def scenario_composed_transition_enforcement() -> dict[str, Any]:
         return summary
 
 
+def scenario_null_field_hardening() -> dict[str, Any]:
+    program = {
+        "program_id": "regression-null-hardening",
+        "goal": "Handle optional JSON fields set to null",
+        "program_state": "IDLE",
+        "last_roadmap_review_ts": "2026-01-01T00:00:00Z",
+        "roadmap_backlog": [
+            {
+                "id": "task-null-backlog",
+                "title": "Null-safe backlog task",
+                "priority": None,
+                "deadline_ts": "2026-05-24T00:00:00Z",
+                "depends_on": None,
+                "required_checks": None,
+            }
+        ],
+        "review_log": [],
+    }
+    queue = {
+        "tasks": [
+            {
+                "id": "task-null-deps",
+                "title": "Null-safe dependency list",
+                "state": "BLOCKED",
+                "blocked_reason": "manual",
+                "depends_on": None,
+            },
+            {
+                "id": "task-null-blocked",
+                "title": "Null-priority blocked task remains blocked",
+                "state": "BLOCKED",
+                "blocked_reason": "waiting_on_external",
+                "depends_on": ["task-missing-null"],
+                "priority": None,
+            },
+        ]
+    }
+    summary = summarize_composed_run("null-hardening", program, queue, min_open=1)
+    require_composed_invariants(summary)
+    require(
+        summary["generated_order"] == ["task-null-backlog"],
+        f"unexpected null-hardening generated order: {summary['generated_order']}",
+    )
+    require(
+        summary["reopened_task_ids"] == ["task-null-deps"],
+        f"unexpected null-hardening reopened tasks: {summary['reopened_task_ids']}",
+    )
+    require(
+        summary["queue_states"]["task-null-blocked"] == "BLOCKED",
+        "null-priority blocked task did not remain blocked",
+    )
+    return summary
+
+
+def scenario_null_backlog_reporting() -> dict[str, Any]:
+    program = {
+        "program_id": "regression-null-backlog-reporting",
+        "goal": "Report cleanly when backlog is null and no review is needed",
+        "program_state": "IDLE",
+        "last_roadmap_review_ts": local_program_loop_v0.utc_now(),
+        "roadmap_backlog": None,
+        "review_log": [],
+    }
+    queue = {
+        "tasks": [
+            {
+                "id": "task-already-done",
+                "title": "Already complete",
+                "state": "DONE",
+            }
+        ]
+    }
+    summary = summarize_composed_run(
+        "null-backlog-reporting",
+        program,
+        queue,
+        min_open=0,
+        timeout_s=300,
+    )
+    require_composed_invariants(summary)
+    require(summary["generated_order"] == [], "null backlog generated work")
+    require(summary["task_artifacts"] == [], "done-only queue created task artifacts")
+    return summary
+
+
 def scenario_determinism() -> dict[str, Any]:
     orders = []
     for _ in range(20):
@@ -476,6 +564,8 @@ def build_summary() -> dict[str, Any]:
         "validation_fail_then_retry": scenario_validation_retry,
         "illegal_transition_guard": scenario_transition_guard,
         "composed_transition_enforcement": scenario_composed_transition_enforcement,
+        "null_field_hardening": scenario_null_field_hardening,
+        "null_backlog_reporting": scenario_null_backlog_reporting,
         "deterministic_scheduling_20_runs": scenario_determinism,
     }
     results = {name: fn() for name, fn in scenarios.items()}

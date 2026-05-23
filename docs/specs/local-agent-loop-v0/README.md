@@ -80,9 +80,9 @@ python3 scripts/test_local_agent_loop_v0.py
 
 The harness runs canonical CLI-level scenarios for backlog refill, all tasks blocked,
 dependency-unblock partial success, validation fail-then-retry, illegal
-transition injection, persisted transition enforcement, and 20 repeated
-deterministic scheduling runs. It exits non-zero if any assertion or checked-in
-fixture comparison fails.
+transition injection, persisted transition enforcement, null optional field
+handling, null backlog reporting, and 20 repeated deterministic scheduling runs.
+It exits non-zero if any assertion or checked-in fixture comparison fails.
 
 ## Expected Behavior
 

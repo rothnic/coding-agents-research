@@ -73,15 +73,30 @@ def utc_now() -> str:
 
 
 def count_tasks(tasks: list[dict[str, Any]]) -> dict[str, int]:
-    return {
-        "open_count": sum(1 for t in tasks if t.get("state") == "OPEN"),
-        "unblocked_count": sum(1 for t in tasks if t.get("state") in UNBLOCKED),
-        "blocked_count": sum(1 for t in tasks if t.get("state") == "BLOCKED"),
-        "done_count": sum(1 for t in tasks if t.get("state") == "DONE"),
-        "failed_count": sum(1 for t in tasks if t.get("state") == "FAILED"),
-        "terminal_count": sum(1 for t in tasks if t.get("state") in TERMINAL),
+    counts = {
+        "open_count": 0,
+        "unblocked_count": 0,
+        "blocked_count": 0,
+        "done_count": 0,
+        "failed_count": 0,
+        "terminal_count": 0,
         "total_count": len(tasks),
     }
+    for task in tasks:
+        state = task.get("state")
+        if state == "OPEN":
+            counts["open_count"] += 1
+        if state in UNBLOCKED:
+            counts["unblocked_count"] += 1
+        if state == "BLOCKED":
+            counts["blocked_count"] += 1
+        if state == "DONE":
+            counts["done_count"] += 1
+        if state == "FAILED":
+            counts["failed_count"] += 1
+        if state in TERMINAL:
+            counts["terminal_count"] += 1
+    return counts
 
 
 def write_program_event(artifacts: Path, event: dict[str, Any]) -> None:
@@ -169,7 +184,7 @@ def choose_unblock_action(reason_code: str, dependency_check: str) -> str:
 
 
 def dependency_check(task: dict[str, Any], by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    depends_on = list(task.get("depends_on", []))
+    depends_on = list(task.get("depends_on") or [])
     missing = [dep for dep in depends_on if dep not in by_id]
     unmet = [
         dep
@@ -207,10 +222,10 @@ def synthesize_tasks(
     min_open: int,
     counts: dict[str, int],
 ) -> list[dict[str, Any]]:
-    backlog = list(program.get("roadmap_backlog", []))
+    backlog = list(program.get("roadmap_backlog") or [])
     ordered = sorted(
         enumerate(backlog),
-        key=lambda pair: (-int(pair[1].get("priority", 0)), deadline_key(pair[1]), pair[0]),
+        key=lambda pair: (-int(pair[1].get("priority") or 0), deadline_key(pair[1]), pair[0]),
     )
     selected_indexes: set[int] = set()
     generated: list[dict[str, Any]] = []
@@ -224,13 +239,13 @@ def synthesize_tasks(
             "title": item["title"],
             "state": "OPEN",
             "retries": 0,
-            "required_checks": item.get("required_checks", ["test", "lint"]),
-            "priority": int(item.get("priority", 0)),
+            "required_checks": item.get("required_checks") or ["test", "lint"],
+            "priority": int(item.get("priority") or 0),
         }
         if item.get("deadline_ts"):
             task["deadline_ts"] = item["deadline_ts"]
         if item.get("depends_on"):
-            task["depends_on"] = list(item.get("depends_on", []))
+            task["depends_on"] = list(item.get("depends_on") or [])
         queue.setdefault("tasks", []).append(task)
         selected_indexes.add(original_index)
         generated.append(task)
@@ -278,7 +293,10 @@ def parse_last_review_elapsed(program: dict[str, Any], timeout_s: int) -> int:
     if not last:
         return timeout_s + 1
     try:
-        return int((datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds())
+        parsed = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int((datetime.now(timezone.utc) - parsed).total_seconds())
     except ValueError:
         return timeout_s + 1
 
@@ -355,11 +373,11 @@ def transition_to_handoff(runner: ProgramRun) -> None:
         require_transition(runner, "HANDING_OFF", "Unblocking review complete")
 
 
-def task_sort_key(task: dict[str, Any]) -> tuple[int, int, str, str]:
+def task_sort_key(task: dict[str, Any]) -> tuple[int, int, tuple[datetime, str], str]:
     state_rank = 0 if task.get("state") in UNBLOCKED else 1
     return (
         state_rank,
-        -int(task.get("priority", 0)),
+        -int(task.get("priority") or 0),
         deadline_key(task),
         str(task.get("id", "")),
     )
@@ -375,7 +393,7 @@ def next_three_tasks(program: dict[str, Any], queue: dict[str, Any]) -> list[dic
         return sorted(queue_tasks, key=task_sort_key)[:3]
 
     backlog = []
-    for item in program.get("roadmap_backlog", [])[:3]:
+    for item in (program.get("roadmap_backlog") or [])[:3]:
         backlog.append(
             {
                 "id": item.get("id"),
@@ -459,7 +477,7 @@ def write_status_markdown(
     lines.extend(["", "## Next 3 Tasks", ""])
     if next_tasks:
         for task in next_tasks:
-            priority = int(task.get("priority", 0))
+            priority = int(task.get("priority") or 0)
             deadline = task.get("deadline_ts") or "none"
             lines.append(
                 f"- `{task.get('id')}` ({task.get('state')}): "
