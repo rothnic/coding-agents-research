@@ -1,4 +1,5 @@
 {
+  "schema_version": "local-agent-loop-v0.3",
   "program_id": "roadmap-001",
   "goal": "Continuously maintain a healthy near-term task queue",
   "program_state": "IDLE",
