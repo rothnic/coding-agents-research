@@ -1,6 +1,7 @@
 # Local Agent Loop v0 — Proof of Concept
 
-This folder includes a runnable local-only proof of concept for a Symphony-like orchestration loop **plus** a composed higher-level roadmap workflow.
+This folder includes a runnable local-only proof of concept for a Symphony-like
+orchestration loop **plus** a composed higher-level roadmap workflow.
 
 ## Two Composable Loops
 
@@ -27,8 +28,10 @@ This directly models: “not only when no tasks exist, but also when no tasks ar
 
 - Worker runner: `scripts/local_agent_loop_v0.py`
 - Program runner: `scripts/local_program_loop_v0.py`
+- Regression harness: `scripts/test_local_agent_loop_v0.py`
 - Program roadmap sample: `docs/specs/local-agent-loop-v0/examples/tasks/program.json`
 - Queue sample: `docs/specs/local-agent-loop-v0/examples/tasks/queue.json`
+- Regression fixture: `docs/specs/local-agent-loop-v0/fixtures/regression/expected-summary.json`
 - Artifact output root (generated): `docs/specs/local-agent-loop-v0/examples/artifacts/`
 
 ## Worker State Machine
@@ -42,28 +45,50 @@ Retry path:
 ## Run Worker Loop Only
 
 ```bash
-python scripts/local_agent_loop_v0.py \
-  --queue docs/specs/local-agent-loop-v0/examples/tasks/queue.json \
-  --artifacts docs/specs/local-agent-loop-v0/examples/artifacts \
+tmp_dir="$(mktemp -d)"
+cp docs/specs/local-agent-loop-v0/examples/tasks/queue.json "$tmp_dir/queue.json"
+
+python3 scripts/local_agent_loop_v0.py \
+  --queue "$tmp_dir/queue.json" \
+  --artifacts "$tmp_dir/artifacts" \
   --max-retries 2
 ```
 
 ## Run Composed Program + Worker Workflow
 
 ```bash
-python scripts/local_program_loop_v0.py \
-  --program docs/specs/local-agent-loop-v0/examples/tasks/program.json \
-  --queue docs/specs/local-agent-loop-v0/examples/tasks/queue.json \
-  --artifacts docs/specs/local-agent-loop-v0/examples/artifacts \
+tmp_dir="$(mktemp -d)"
+cp docs/specs/local-agent-loop-v0/examples/tasks/program.json "$tmp_dir/program.json"
+cp docs/specs/local-agent-loop-v0/examples/tasks/queue.json "$tmp_dir/queue.json"
+
+python3 scripts/local_program_loop_v0.py \
+  --program "$tmp_dir/program.json" \
+  --queue "$tmp_dir/queue.json" \
+  --artifacts "$tmp_dir/artifacts" \
   --min-open 2 \
   --roadmap-timeout-sec 60 \
   --max-retries 2
+
+ls "$tmp_dir/artifacts"
 ```
+
+## Run v0.2 Regression Harness
+
+```bash
+python3 scripts/test_local_agent_loop_v0.py
+```
+
+The harness runs canonical CLI-level scenarios for backlog refill, all tasks blocked,
+dependency-unblock partial success, validation fail-then-retry, illegal
+transition injection, persisted transition enforcement, and 20 repeated
+deterministic scheduling runs. It exits non-zero if any assertion or checked-in
+fixture comparison fails.
 
 ## Expected Behavior
 
 - Program loop can generate additional near-term tasks from roadmap backlog.
-- Program loop can reopen blocked work when no unblocked tasks remain.
+- Program loop can reopen blocked work when dependencies are satisfied.
+- Program loop leaves blocked work blocked when dependencies are missing or unmet.
 - Worker loop processes runnable tasks and writes per-task artifacts.
 
 ## Artifact Contract
@@ -86,7 +111,9 @@ Each roadmap review appends an entry in `program.json.review_log` with:
 - `reason.no_unblocked_tasks`
 - `reason.timeout_elapsed`
 - `generated_tasks`
-- `unblocked_task_id` (if an unblock action was taken)
+- `generated_task_ids`
+- `unblock_decisions`
+- `reopened_task_ids`
 
 
 ## Program-Level Artifacts
@@ -94,25 +121,33 @@ Each roadmap review appends an entry in `program.json.review_log` with:
 The program loop now also writes a higher-level event stream:
 
 - `roadmap_events.ndjson` (under the same artifacts root)
+- `roadmap_status.md`
+- `program_metrics.json`
 
-Each event contains the roadmap review decision payload for auditing high-level planning/replanning behavior.
+Each program event includes `from_program_state` and `to_program_state` for
+auditing high-level planning/replanning behavior.
 
 ## Unblocking Policy
 
-When no unblocked tasks exist, the program loop reopens one blocked task and records the policy used:
+When no unblocked tasks exist, the program loop reviews every blocked task,
+reopens each dependency-ready task, and records the policy used:
 
 - `waiting_on_external` -> `request_sync_and_reopen`
 - `needs_clarification` -> `create_clarification_task_and_reopen`
 - `missing_dependency` -> `create_dependency_task_and_reopen`
 - fallback -> `manual_review_then_reopen`
 
-## Next Logical Functionality (v0.2 Plan) with Discrete Success Criteria
+Blocked tasks now also support `depends_on: ["task-id"]`. A blocked task is only
+reopened when every dependency is `DONE`, unless the task explicitly sets
+`dependency_override` or `override_dependencies`.
 
-This is the recommended next increment focused on user-facing reliability and measurable completion.
+## v0.2 Functionality with Discrete Success Criteria
+
+This increment is implemented and covered by `python3 scripts/test_local_agent_loop_v0.py`.
 
 ### 1) Dependency-Aware Unblocking Graph
 
-**What to add**
+**Implemented**
 - Represent task dependencies explicitly (`depends_on: [task-id...]`).
 - Prevent reopening blocked tasks unless dependencies are resolved or explicitly overridden.
 - Add blocked-cause normalization (`blocked_reason_code`) and a deterministic unblock action matrix.
@@ -130,7 +165,7 @@ This is the recommended next increment focused on user-facing reliability and me
 
 ### 2) Program State Machine + Transition Guardrails
 
-**What to add**
+**Implemented**
 - Introduce explicit program states:
   - `ROADMAP_REVIEWING`, `TASK_SYNTHESIZING`, `UNBLOCKING`, `HANDING_OFF`, `IDLE`.
 - Enforce legal transitions and record transition failures as events.
@@ -145,9 +180,10 @@ This is the recommended next increment focused on user-facing reliability and me
 
 ### 3) Priority and Scheduling Policy
 
-**What to add**
+**Implemented**
 - Add `priority` and optional `deadline_ts` to roadmap backlog items.
-- Generate near-term tasks by deterministic ordering (priority desc, earliest deadline, FIFO tie-break).
+- Generate near-term tasks by deterministic ordering (priority desc, earliest
+  deadline, FIFO tie-break).
 
 **Success criteria**
 - In a mixed-priority fixture, generated tasks are always emitted in expected order.
@@ -159,13 +195,14 @@ This is the recommended next increment focused on user-facing reliability and me
 
 ### 4) High-Level Outcome Reporting
 
-**What to add**
+**Implemented**
 - New artifact: `roadmap_status.md` summarizing objective progress, blockers, and next 3 tasks.
 - Add compact JSON snapshot `program_metrics.json` with counts and rates.
 
 **Success criteria**
 - After each composed run, both artifacts are updated once.
-- Metrics include: `open_count`, `blocked_count`, `unblocked_count`, `generated_count`, `done_count`, `failed_count`.
+- Metrics include: `open_count`, `blocked_count`, `unblocked_count`,
+  `generated_count`, `done_count`, `failed_count`.
 
 **Measurable checks**
 - Artifact freshness: timestamp delta between run start and artifact write `< 5s`.
@@ -173,7 +210,7 @@ This is the recommended next increment focused on user-facing reliability and me
 
 ### 5) Regression Test Harness (CLI-Level)
 
-**What to add**
+**Implemented**
 - Add a lightweight local test script that executes canonical scenarios:
   - backlog refill,
   - all tasks blocked,
@@ -192,7 +229,7 @@ This is the recommended next increment focused on user-facing reliability and me
 
 v0.2 is complete only when:
 - all five functionality areas above are implemented,
-- all measurable checks pass in CI/local repeated runs,
+- all measurable checks pass in local repeated runs,
 - README examples are updated and reproducible from clean checkout,
 - at least one end-to-end run demonstrates:
   - roadmap review,
@@ -200,3 +237,13 @@ v0.2 is complete only when:
   - dependency-aware unblocking,
   - worker execution,
   - auditable program + task artifacts.
+
+Completion gate:
+
+```bash
+python3 -m py_compile \
+  scripts/local_agent_loop_v0.py \
+  scripts/local_program_loop_v0.py \
+  scripts/test_local_agent_loop_v0.py
+python3 scripts/test_local_agent_loop_v0.py
+```
