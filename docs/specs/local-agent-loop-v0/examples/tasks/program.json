@@ -1,29 +1,27 @@
 {
   "program_id": "roadmap-001",
   "goal": "Continuously maintain a healthy near-term task queue",
-  "last_roadmap_review_ts": "2026-05-23T18:56:25.913826+00:00",
-  "roadmap_backlog": [],
-  "review_log": [
+  "program_state": "IDLE",
+  "last_roadmap_review_ts": "2026-01-01T00:00:00+00:00",
+  "roadmap_backlog": [
     {
-      "ts": "2026-05-23T18:47:28.081586+00:00",
-      "reason": {
-        "open_below_threshold": true,
-        "no_unblocked_tasks": false,
-        "timeout_elapsed": true
-      },
-      "generated_tasks": 2,
-      "unblocked_task_id": null
+      "id": "task-002",
+      "title": "Implement parser hardening",
+      "priority": 30,
+      "deadline_ts": "2026-05-27T00:00:00+00:00"
     },
     {
-      "ts": "2026-05-23T18:56:25.913826+00:00",
-      "reason": {
-        "open_below_threshold": true,
-        "no_unblocked_tasks": true,
-        "timeout_elapsed": true
-      },
-      "generated_tasks": 0,
-      "unblocked_task_id": "task-blocked-001",
-      "unblock_policy": "create_dependency_task_and_reopen"
+      "id": "task-003",
+      "title": "Improve test coverage for queue claims",
+      "priority": 80,
+      "deadline_ts": "2026-05-26T00:00:00+00:00"
+    },
+    {
+      "id": "task-004",
+      "title": "Document operational handoff checklist",
+      "priority": 80,
+      "deadline_ts": "2026-05-29T00:00:00+00:00"
     }
-  ]
+  ],
+  "review_log": []
 }
