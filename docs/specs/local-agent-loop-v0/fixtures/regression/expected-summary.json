@@ -1,6 +1,6 @@
 {
-  "scenario_count": 14,
-  "scenario_pass_count": 14,
+  "scenario_count": 26,
+  "scenario_pass_count": 26,
   "scenarios": {
     "all_tasks_blocked": {
       "all_program_events_have_state_fields": true,
@@ -519,6 +519,99 @@
       "retries": 1,
       "validation_attempt": 2,
       "validation_passed": true
+    },
+    "worktree_ambiguous_branch_rejected": {
+      "branch_commit_count": 2,
+      "commit_sha": null,
+      "integrity_error_count": 0,
+      "task_state": "FAILED",
+      "validation_message": "preexisting task branch changes do not match the deterministic task path"
+    },
+    "worktree_branch_and_worktree_reuse": {
+      "branch_preexisted": true,
+      "commit_sha_valid": true,
+      "integrity_error_count": 0,
+      "task_state": "DONE",
+      "worktree_preexisted": true
+    },
+    "worktree_dirty_guard": {
+      "change_file_created": false,
+      "commit_sha": null,
+      "dirty_status_before_count": 1,
+      "integrity_error_count": 0,
+      "task_state": "FAILED",
+      "validation_message": "Worktree is dirty before execution; refusing to mutate"
+    },
+    "worktree_interrupted_existing_commit_recovery": {
+      "branch_preexisted": true,
+      "commit_count_on_branch": 2,
+      "metadata_commit_reused": true,
+      "same_commit_reused": true,
+      "task_state": "DONE",
+      "worktree_preexisted": true
+    },
+    "worktree_metadata_tamper_detection": {
+      "branch_mismatch_detected": true,
+      "error_count": 3,
+      "path_mismatch_detected": true
+    },
+    "worktree_missing_artifact_detection": {
+      "error_count": 1,
+      "missing_worktree_metadata_detected": true
+    },
+    "worktree_relative_dir_cli": {
+      "relative_worktree_root_created": true,
+      "task_state": "DONE",
+      "worktree_path_is_absolute": true
+    },
+    "worktree_rerun_idempotency": {
+      "commit_count_after_first": 2,
+      "commit_count_after_second": 2,
+      "commit_sha_valid": true,
+      "same_commit_sha": true,
+      "task_event_count_after_first": 5,
+      "task_event_count_after_second": 5,
+      "task_ids": [
+        "task-worktree-once"
+      ],
+      "unique_task_id_count": 1,
+      "worktree_dir_count": 1
+    },
+    "worktree_success": {
+      "branch_exists": true,
+      "change_file_exists": true,
+      "commit_count_on_branch": 2,
+      "commit_sha_valid": true,
+      "integrity_error_count": 0,
+      "metadata_commit_matches_task": true,
+      "processed_by": "local-agent-loop-worktree-v0",
+      "task_state": "DONE",
+      "validation_passed": true
+    },
+    "worktree_task_id_collision_isolated": {
+      "commit_sha_count": 2,
+      "states": [
+        "DONE",
+        "DONE"
+      ],
+      "unique_branch_count": 2,
+      "unique_worktree_path_count": 2
+    },
+    "worktree_terminal_artifact_recovery": {
+      "event_count_after_first": 5,
+      "event_count_after_second": 5,
+      "integrity_error_count": 0,
+      "same_commit_recovered": true,
+      "task_state": "DONE"
+    },
+    "worktree_validation_failure_no_commit": {
+      "branch_commit_count": 1,
+      "commit_sha": null,
+      "dirty_after_detected": true,
+      "integrity_error_count": 0,
+      "metadata_commit_sha": null,
+      "task_state": "FAILED",
+      "validation_passed": false
     }
   }
 }

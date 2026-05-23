@@ -20,12 +20,18 @@ from local_agent_loop_v0 import (
     SCHEMA_VERSION,
     TERMINAL_STATES,
     TASK_STATES,
+    WORKTREE_METADATA_ARTIFACT,
+    WORKTREE_PROCESSED_BY,
     ValidationError,
+    WorktreeConfig,
+    WorktreeExecutionError,
+    build_worktree_config,
     format_validation_errors,
     parse_iso8601,
     queue_counts,
     read_json,
     run,
+    run_git,
     validate_iso8601_field,
     validate_queue_document,
     validate_string_list,
@@ -725,6 +731,128 @@ def validate_event_metadata(
             validate_iso8601_field(event[field], f"{label}.{field}", errors)
 
 
+def is_commit_sha(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 40
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def verify_worktree_metadata(
+    task: dict[str, Any],
+    task_dir: Path,
+    errors: list[str],
+) -> None:
+    task_id = task["id"]
+    metadata_path = task_dir / WORKTREE_METADATA_ARTIFACT
+    if not metadata_path.exists():
+        errors.append(f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: missing required artifact")
+        return
+    if metadata_path.stat().st_size == 0:
+        errors.append(f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: artifact is empty")
+        return
+
+    metadata = read_artifact_object(metadata_path, errors)
+    if metadata is None:
+        return
+    if metadata.get("schema_version") != SCHEMA_VERSION:
+        errors.append(
+            f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: unsupported schema version "
+            f"{metadata.get('schema_version')!r}"
+        )
+    if metadata.get("task_id") != task_id:
+        errors.append(f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: task_id mismatch")
+    if not isinstance(metadata.get("branch_name"), str) or not metadata["branch_name"].strip():
+        errors.append(f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: missing branch_name")
+    elif task.get("worktree_branch") and metadata["branch_name"] != task.get("worktree_branch"):
+        errors.append(f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: branch_name mismatch")
+    if not isinstance(metadata.get("worktree_path"), str) or not metadata["worktree_path"].strip():
+        errors.append(f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: missing worktree_path")
+    elif task.get("worktree_path") and metadata["worktree_path"] != task.get("worktree_path"):
+        errors.append(f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: worktree_path mismatch")
+    if task.get("worktree_base_ref") and metadata.get("base_ref") != task.get("worktree_base_ref"):
+        errors.append(f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: base_ref mismatch")
+    if task.get("worktree_change_path") and metadata.get("change_path") != task.get("worktree_change_path"):
+        errors.append(f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: change_path mismatch")
+    if metadata.get("final_task_state") != task.get("state"):
+        errors.append(
+            f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: final task state mismatch"
+        )
+    validation_output = metadata.get("validation_output")
+    if not isinstance(validation_output, dict):
+        errors.append(
+            f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: missing validation_output"
+        )
+    else:
+        if validation_output.get("task_id") != task_id:
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: validation task_id mismatch"
+            )
+        if task.get("state") == "DONE" and validation_output.get("passed") is not True:
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: DONE task validation failed"
+            )
+        if task.get("state") == "FAILED" and validation_output.get("passed") is not False:
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: FAILED task has passing validation"
+            )
+
+    commit_sha = metadata.get("commit_sha")
+    if task.get("state") == "DONE":
+        if not is_commit_sha(commit_sha):
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: DONE task missing commit SHA"
+            )
+        if task.get("worktree_commit_sha") != commit_sha:
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: commit SHA mismatch"
+            )
+        worktree_path_value = metadata.get("worktree_path")
+        if not isinstance(worktree_path_value, str) or not worktree_path_value.strip():
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: worktree path is invalid"
+            )
+        else:
+            worktree_path = Path(worktree_path_value)
+            if not (worktree_path / ".git").exists():
+                errors.append(
+                    f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: worktree path is not a git worktree"
+                )
+                return
+            try:
+                actual_branch = run_git(
+                    worktree_path,
+                    ["rev-parse", "--abbrev-ref", "HEAD"],
+                    check=True,
+                ).stdout.strip()
+                actual_head = run_git(
+                    worktree_path,
+                    ["rev-parse", "HEAD"],
+                    check=True,
+                ).stdout.strip()
+            except WorktreeExecutionError as exc:
+                errors.append(
+                    f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: git metadata check failed: {exc}"
+                )
+            else:
+                if actual_branch != metadata.get("branch_name"):
+                    errors.append(
+                        f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: actual branch mismatch"
+                    )
+                if is_commit_sha(commit_sha) and actual_head != commit_sha:
+                    errors.append(
+                        f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: actual HEAD mismatch"
+                    )
+    if task.get("state") == "FAILED":
+        if commit_sha is not None:
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: FAILED task has commit SHA"
+            )
+        if task.get("worktree_commit_sha"):
+            errors.append(f"artifacts/{task_id}: FAILED task has worktree_commit_sha")
+
+
 def verify_task_artifacts(task: dict[str, Any], artifacts: Path) -> list[str]:
     errors: list[str] = []
     task_id = task["id"]
@@ -754,6 +882,9 @@ def verify_task_artifacts(task: dict[str, Any], artifacts: Path) -> list[str]:
                 errors.append(f"artifacts/{task_id}/validation.json: DONE task did not pass")
             if task["state"] == "FAILED" and validation.get("passed") is not False:
                 errors.append(f"artifacts/{task_id}/validation.json: FAILED task did not fail")
+
+    if task.get("processed_by") == WORKTREE_PROCESSED_BY:
+        verify_worktree_metadata(task, task_dir, errors)
 
     events_path = task_dir / "events.ndjson"
     if events_path.exists():
@@ -856,7 +987,10 @@ def verify_artifact_integrity(
                 errors.append(f"{event_label}: invalid to_program_state")
 
     for task in queue.get("tasks", []):
-        if task.get("state") in TERMINAL and task.get("processed_by") == "local-agent-loop-v0":
+        if task.get("state") in TERMINAL and task.get("processed_by") in {
+            "local-agent-loop-v0",
+            WORKTREE_PROCESSED_BY,
+        }:
             errors.extend(verify_task_artifacts(task, artifacts))
 
     return errors
@@ -888,11 +1022,13 @@ def build_worker_dry_run_summary(
     queue: dict[str, Any],
     queue_file: Path,
     artifacts: Path,
+    execution_mode: str = "state-machine",
 ) -> dict[str, Any]:
     tasks = queue.get("tasks", [])
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": "dry-run",
+        "execution_mode": execution_mode,
         "queue_file": str(queue_file),
         "artifacts": str(artifacts),
         "runnable_task_ids": [
@@ -914,6 +1050,7 @@ def run_program(
     max_retries: int,
     dry_run: bool = False,
     review_only: bool = False,
+    worktree_config: WorktreeConfig | None = None,
 ) -> dict[str, Any]:
     run_started_ts = utc_now()
     loaded_program, loaded_queue = load_validated_inputs(program_file, queue_file)
@@ -946,12 +1083,18 @@ def run_program(
     worker_summary: dict[str, Any] | None = None
     if not review_only:
         if dry_run:
-            worker_summary = build_worker_dry_run_summary(queue, queue_file, artifacts)
+            worker_summary = build_worker_dry_run_summary(
+                queue,
+                queue_file,
+                artifacts,
+                "worktree" if worktree_config is not None else "state-machine",
+            )
         else:
             worker_summary = run(
                 queue_file=queue_file,
                 artifacts_root=artifacts,
                 max_retries=max_retries,
+                worktree_config=worktree_config,
             )
 
     if not dry_run and not review_only:
@@ -975,6 +1118,7 @@ def run_program(
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": "dry-run" if dry_run else "run",
+        "execution_mode": "worktree" if worktree_config is not None else "state-machine",
         "review_only": review_only,
         "program_file": str(program_file),
         "queue_file": str(queue_file),
@@ -1001,6 +1145,19 @@ def add_program_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-retries", type=int, default=2)
 
 
+def add_worktree_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--execution-mode",
+        choices=("state-machine", "worktree"),
+        default="state-machine",
+        help="Use the default state-machine worker or git worktree-backed execution",
+    )
+    parser.add_argument("--worktree-repo", type=Path)
+    parser.add_argument("--worktrees-dir", type=Path)
+    parser.add_argument("--worktree-base-ref", default="HEAD")
+    parser.add_argument("--worktree-branch-prefix", default="codex/local-agent-loop")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Operate local-agent-loop-v0")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1020,6 +1177,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker_parser.add_argument("--artifacts", type=Path, required=True)
     worker_parser.add_argument("--max-retries", type=int, default=2)
     worker_parser.add_argument("--dry-run", action="store_true")
+    add_worktree_args(worker_parser)
 
     program_parser = subparsers.add_parser(
         "run-program",
@@ -1032,6 +1190,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run roadmap review and reporting without invoking the worker",
     )
+    add_worktree_args(program_parser)
 
     status_parser = subparsers.add_parser("status", help="Print compact program status")
     status_parser.add_argument("--program", type=Path, required=True)
@@ -1067,13 +1226,28 @@ def main(argv: list[str] | None = None) -> int:
                 )
             summary["valid"] = True
         elif args.command == "run-worker":
+            worktree_config = build_worktree_config(
+                args.execution_mode,
+                args.worktree_repo,
+                args.worktrees_dir,
+                args.worktree_base_ref,
+                args.worktree_branch_prefix,
+            )
             summary = run(
                 queue_file=args.queue,
                 artifacts_root=args.artifacts,
                 max_retries=args.max_retries,
                 dry_run=args.dry_run,
+                worktree_config=worktree_config,
             )
         elif args.command == "run-program":
+            worktree_config = build_worktree_config(
+                args.execution_mode,
+                args.worktree_repo,
+                args.worktrees_dir,
+                args.worktree_base_ref,
+                args.worktree_branch_prefix,
+            )
             summary = run_program(
                 program_file=args.program,
                 queue_file=args.queue,
@@ -1083,6 +1257,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_retries=args.max_retries,
                 dry_run=args.dry_run,
                 review_only=args.review_only,
+                worktree_config=worktree_config,
             )
         elif args.command == "status":
             program, queue = load_validated_inputs(args.program, args.queue)
@@ -1090,7 +1265,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             parser.error(f"unknown command {args.command!r}")
             return 2
-    except ValidationError as exc:
+    except (ValidationError, WorktreeExecutionError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
