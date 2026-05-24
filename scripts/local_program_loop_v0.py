@@ -864,17 +864,18 @@ def verify_command_output_artifacts(
             if not isinstance(output_doc.get("timed_out"), bool):
                 errors.append(f"artifacts/{task_id}/{artifact}: timed_out must be boolean")
         expected = expected_command_identities(metadata, field)
-        if expected and outputs:
-            actual = [
-                identity
-                for output in outputs
-                if (identity := command_identity(output, "argv")) is not None
-            ]
-            if actual != expected:
-                errors.append(
-                    f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: "
-                    f"{field} does not match declared commands"
-                )
+        actual = [
+            identity
+            for output in outputs
+            if (identity := command_identity(output, "argv")) is not None
+        ]
+        if expected and actual != expected and (
+            outputs or metadata.get("final_task_state") == "DONE"
+        ):
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: "
+                f"{field} does not match declared commands"
+            )
 
 
 def verify_worktree_metadata(

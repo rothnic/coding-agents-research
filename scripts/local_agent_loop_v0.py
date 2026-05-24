@@ -1251,7 +1251,12 @@ def execute_worktree_task(
                             output.get("timed_out")
                             for output in action_outputs
                         )
-                        metadata["change_path"] = action.expected_paths[0].as_posix()
+                        primary_change_path = (
+                            action.expected_paths[0].as_posix()
+                            if action.expected_paths
+                            else None
+                        )
+                        metadata["change_path"] = primary_change_path
                         validation_result = validate_worktree_action(
                             task,
                             worktree_path,
@@ -1301,9 +1306,7 @@ def execute_worktree_task(
                                 task["worktree_branch"] = metadata["branch_name"]
                                 task["worktree_path"] = metadata["worktree_path"]
                                 task["worktree_base_ref"] = cfg.base_ref
-                                task["worktree_change_path"] = action.expected_paths[
-                                    0
-                                ].as_posix()
+                                task["worktree_change_path"] = primary_change_path
                                 task["worktree_action_adapter"] = action.adapter
                                 task["worktree_commit_sha"] = commit_sha
                                 transition(
