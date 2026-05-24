@@ -50,10 +50,13 @@ The operator entrypoint is `scripts/local_program_loop_v0.py`:
 - `run-worker` executes only the task worker loop.
 - `run-program` validates inputs, runs roadmap review, hands off to the worker,
   writes program artifacts, and verifies artifact integrity.
+- `integrate` runs the v0.6 integration phase over completed worktree tasks.
 - `status` prints a compact JSON status snapshot and optional artifact errors.
 - `run-worker` and `run-program` can opt into v0.4 git worktree execution with
   `--execution-mode worktree`. v0.5 keeps that mode explicit and adds
   policy-driven local action adapters for worktree tasks.
+- `run-program` can opt into v0.6 integration with `--integration-mode`.
+  Integration is off by default; `local-merge` must be selected explicitly.
 
 The worker script still supports direct task execution through
 `scripts/local_agent_loop_v0.py`, but the program CLI is the preferred
@@ -257,6 +260,9 @@ cat > "$adapter_tmp/queue.json" <<'JSON'
 }
 JSON
 
+cp "$adapter_tmp/program.json" "$adapter_tmp/program.pristine.json"
+cp "$adapter_tmp/queue.json" "$adapter_tmp/queue.pristine.json"
+
 python3 scripts/local_program_loop_v0.py run-program \
   --program "$adapter_tmp/program.json" \
   --queue "$adapter_tmp/queue.json" \
@@ -273,6 +279,91 @@ python3 scripts/local_program_loop_v0.py validate \
   --program "$adapter_tmp/program.json" \
   --queue "$adapter_tmp/queue.json" \
   --artifacts "$adapter_tmp/artifacts" \
+  --check-artifacts
+```
+
+## v0.6 Integration Contract
+
+v0.6 adds an explicit integration phase for completed worktree tasks. The
+phase only considers worktree-backed tasks with `DONE` execution state, valid
+adapter metadata, passing validation evidence, and a recorded task commit SHA.
+It never runs by default.
+
+Integration modes:
+
+- `report-only`: writes merge-readiness artifacts without changing the target
+  repo base branch.
+- `local-merge`: merges eligible task branches into the target repo base branch
+  and must be selected explicitly with `--integration-mode local-merge`.
+
+The local integration policy is built from CLI flags and, optionally, an
+`--integration-policy` JSON file. Policy fields are:
+
+- `schema_version`: `local-agent-loop-v0.3`
+- `target_base_ref`: base branch/ref to inspect or merge, usually `main`
+- `allowed_branch_prefixes`: task branch prefixes eligible for integration
+- `require_clean_target`: require a clean target repo before integration
+- `allow_fast_forward`: permit fast-forward integration
+- `allow_merge_commit`: permit non-fast-forward merge commits
+
+The integration phase rejects or blocks tasks when execution artifacts are
+missing or tampered, validation failed, the task branch is ambiguous, the target
+base moved unexpectedly, merge conflicts occur, or the task is not `DONE`.
+
+For each considered task, v0.6 writes
+`<artifacts>/<task-id>/integration.json`. The program-level integration
+artifacts are `integration_report.json` and `integration_events.ndjson`.
+These artifacts record merge mode, base ref, base SHAs, task branch, task
+commit SHA, merge or fast-forward SHA, conflict diagnostics, skipped reasons,
+and final integration state.
+
+Run report-only integration over the completed command-backed smoke state:
+
+```bash
+python3 scripts/local_program_loop_v0.py integrate \
+  --program "$adapter_tmp/program.json" \
+  --queue "$adapter_tmp/queue.json" \
+  --artifacts "$adapter_tmp/artifacts" \
+  --worktree-repo "$target_repo" \
+  --worktree-base-ref main \
+  --integration-mode report-only
+```
+
+Run a clean command-backed task and integrate it into `main` in one explicit
+local-merge command. This example assumes `program.json` and `queue.json` use
+the command-backed payload from the previous smoke section:
+
+```bash
+merge_tmp="$(mktemp -d)"
+merge_repo="$merge_tmp/target-repo"
+mkdir -p "$merge_repo"
+git -C "$merge_repo" init
+git -C "$merge_repo" config user.name "Local Agent Loop"
+git -C "$merge_repo" config user.email "loop@example.invalid"
+printf '# Fixture Repository\n' > "$merge_repo/README.md"
+git -C "$merge_repo" add README.md
+git -C "$merge_repo" commit -m "Initial fixture"
+git -C "$merge_repo" branch -M main
+cp "$adapter_tmp/program.pristine.json" "$merge_tmp/program.json"
+cp "$adapter_tmp/queue.pristine.json" "$merge_tmp/queue.json"
+
+python3 scripts/local_program_loop_v0.py run-program \
+  --program "$merge_tmp/program.json" \
+  --queue "$merge_tmp/queue.json" \
+  --artifacts "$merge_tmp/artifacts" \
+  --min-open 1 \
+  --roadmap-timeout-sec 60 \
+  --max-retries 2 \
+  --execution-mode worktree \
+  --worktree-repo "$merge_repo" \
+  --worktrees-dir "$merge_tmp/worktrees" \
+  --worktree-base-ref main \
+  --integration-mode local-merge
+
+python3 scripts/local_program_loop_v0.py validate \
+  --program "$merge_tmp/program.json" \
+  --queue "$merge_tmp/queue.json" \
+  --artifacts "$merge_tmp/artifacts" \
   --check-artifacts
 ```
 
@@ -373,6 +464,25 @@ blocked until dependencies are satisfied or explicitly overridden.
 - Reruns skip terminal tasks and do not duplicate branches, worktrees, commits,
   task events, synthesized tasks, or command output artifacts.
 
+## Durable v0.6 Integration Behavior
+
+- Integration is a separate phase from task execution. Task execution state stays
+  in `task.state`; merge readiness and merge outcome stay in
+  `task.integration_state`.
+- `report-only` writes `READY`, `SKIPPED`, `FAILED`, or `BLOCKED` integration
+  artifacts without changing the target repo base branch.
+- `local-merge` requires an explicit CLI opt-in, a clean target repo, a named
+  base ref, valid worktree metadata, passing validation evidence, a single task
+  commit, and an allowed task branch prefix.
+- Successful local merges record `MERGED` plus the merge commit SHA or
+  fast-forward SHA. If the task commit is already contained in the base branch,
+  reruns reuse the existing integration artifact and do not create another
+  merge.
+- Merge conflicts are recorded as `BLOCKED` with conflict diagnostics, the merge
+  is aborted, and task execution artifacts remain intact.
+- Artifact integrity rejects integrated tasks missing worktree adapter metadata,
+  validation evidence, task commit SHA, integration metadata, or merge SHA.
+
 ## Expected Behavior
 
 - Program loop can generate additional near-term tasks from roadmap backlog.
@@ -395,6 +505,7 @@ For each worktree-backed processed task, the worker also writes:
 
 - `worktree.json`
 - `command-outputs/*.json` when action or validation commands run
+- `integration.json` when the task is considered by the integration phase
 
 `worktree.json` records branch name, worktree path, base ref, action adapter,
 action inputs, expected change paths, validation commands, command output
@@ -409,6 +520,8 @@ The program loop writes:
 - `roadmap_events.ndjson`
 - `roadmap_status.md`
 - `program_metrics.json`
+- `integration_report.json` when integration runs
+- `integration_events.ndjson` when integration runs
 
 `program_metrics.json` must match the final queue and program state for counts,
 program id, program state, backlog count, review log count, and schema version.
@@ -459,11 +572,15 @@ isolation, metadata tamper detection, and relative worktree-dir CLI handling.
 v0.5 adds adapter scenarios for command-backed success, validation command
 failure, command timeout, adapter reruns, missing command output artifacts,
 missing `DONE` metadata, unknown adapter rejection, ambiguous command rejection,
-missing validation evidence, and unsafe action path rejection.
+missing validation evidence, and unsafe action path rejection. v0.6 adds
+integration scenarios for report-only readiness, local-merge idempotency,
+merge conflicts, target-base drift, not-`DONE` rejection, ambiguous task
+branches, dirty target repos, policy contract branch allowlists, and integrated
+artifact integrity.
 
 It exits non-zero if any assertion or checked-in fixture comparison fails.
 
-## Completion Gate for v0.5
+## Completion Gate for v0.6
 
 ```bash
 PYTHONPYCACHEPREFIX="$(mktemp -d)" python3 -m py_compile \
@@ -591,6 +708,8 @@ queue = {
 open(program_path, "w", encoding="utf-8").write(json.dumps(program, indent=2) + "\n")
 open(queue_path, "w", encoding="utf-8").write(json.dumps(queue, indent=2) + "\n")
 PY
+cp "$adapter_tmp/program.json" "$adapter_tmp/program.pristine.json"
+cp "$adapter_tmp/queue.json" "$adapter_tmp/queue.pristine.json"
 python3 scripts/local_program_loop_v0.py run-program \
   --program "$adapter_tmp/program.json" \
   --queue "$adapter_tmp/queue.json" \
@@ -606,6 +725,44 @@ python3 scripts/local_program_loop_v0.py validate \
   --program "$adapter_tmp/program.json" \
   --queue "$adapter_tmp/queue.json" \
   --artifacts "$adapter_tmp/artifacts" \
+  --check-artifacts
+
+python3 scripts/local_program_loop_v0.py integrate \
+  --program "$adapter_tmp/program.json" \
+  --queue "$adapter_tmp/queue.json" \
+  --artifacts "$adapter_tmp/artifacts" \
+  --worktree-repo "$target_repo" \
+  --worktree-base-ref main \
+  --integration-mode report-only
+
+merge_tmp="$(mktemp -d)"
+merge_repo="$merge_tmp/target-repo"
+mkdir -p "$merge_repo"
+git -C "$merge_repo" init
+git -C "$merge_repo" config user.name "Local Agent Loop"
+git -C "$merge_repo" config user.email "loop@example.invalid"
+printf '# Fixture Repository\n' > "$merge_repo/README.md"
+git -C "$merge_repo" add README.md
+git -C "$merge_repo" commit -m "Initial fixture"
+git -C "$merge_repo" branch -M main
+cp "$adapter_tmp/program.pristine.json" "$merge_tmp/program.json"
+cp "$adapter_tmp/queue.pristine.json" "$merge_tmp/queue.json"
+python3 scripts/local_program_loop_v0.py run-program \
+  --program "$merge_tmp/program.json" \
+  --queue "$merge_tmp/queue.json" \
+  --artifacts "$merge_tmp/artifacts" \
+  --min-open 1 \
+  --roadmap-timeout-sec 60 \
+  --max-retries 2 \
+  --execution-mode worktree \
+  --worktree-repo "$merge_repo" \
+  --worktrees-dir "$merge_tmp/worktrees" \
+  --worktree-base-ref main \
+  --integration-mode local-merge
+python3 scripts/local_program_loop_v0.py validate \
+  --program "$merge_tmp/program.json" \
+  --queue "$merge_tmp/queue.json" \
+  --artifacts "$merge_tmp/artifacts" \
   --check-artifacts
 
 git diff --check

@@ -30,6 +30,7 @@ from local_agent_loop_v0 import (
     WorktreeExecutionError,
     build_worktree_config,
     format_validation_errors,
+    git_status_lines,
     parse_iso8601,
     queue_counts,
     read_json,
@@ -100,6 +101,24 @@ PROGRAM_TIMESTAMP_FIELDS = (
 )
 BACKLOG_TIMESTAMP_FIELDS = ("deadline_ts",)
 PROGRAM_ARTIFACTS = ("roadmap_events.ndjson", "roadmap_status.md", "program_metrics.json")
+INTEGRATION_ARTIFACT = "integration.json"
+INTEGRATION_REPORT_ARTIFACT = "integration_report.json"
+INTEGRATION_EVENTS_ARTIFACT = "integration_events.ndjson"
+INTEGRATION_MODES = {"off", "report-only", "local-merge"}
+ACTIVE_INTEGRATION_MODES = INTEGRATION_MODES - {"off"}
+INTEGRATION_STATES = {"NOT_REQUESTED", "READY", "MERGED", "SKIPPED", "FAILED", "BLOCKED"}
+TERMINAL_INTEGRATION_STATES = {"MERGED", "SKIPPED", "FAILED", "BLOCKED"}
+
+
+@dataclass(frozen=True)
+class IntegrationPolicy:
+    mode: str
+    repo: Path
+    target_base_ref: str
+    allowed_branch_prefixes: tuple[str, ...]
+    require_clean_target: bool = True
+    allow_fast_forward: bool = True
+    allow_merge_commit: bool = True
 
 
 def utc_now() -> str:
@@ -588,6 +607,7 @@ def build_metrics(
     run_started_ts: str,
 ) -> dict[str, Any]:
     counts = count_tasks(queue.get("tasks", []))
+    integrations = integration_counts(queue.get("tasks", []))
     total = counts["total_count"] or 1
     generated = review_entry.get("generated_tasks", 0) if review_entry else 0
     reopened = len(review_entry.get("reopened_task_ids", [])) if review_entry else 0
@@ -608,6 +628,7 @@ def build_metrics(
         "failed_count": counts["failed_count"],
         "terminal_count": counts["terminal_count"],
         "total_count": counts["total_count"],
+        "integration_counts": integrations,
         "done_rate": counts["done_count"] / total,
         "failed_rate": counts["failed_count"] / total,
         "blocked_rate": counts["blocked_count"] / total,
@@ -644,6 +665,15 @@ def write_status_markdown(
         f"- Open: `{metrics['open_count']}`",
         f"- Blocked: `{metrics['blocked_count']}`",
         f"- Generated this run: `{metrics['generated_count']}`",
+        "",
+        "## Integration",
+        "",
+        f"- Candidates: `{metrics['integration_counts']['total_integration_candidates']}`",
+        f"- Ready: `{metrics['integration_counts']['ready_count']}`",
+        f"- Merged: `{metrics['integration_counts']['merged_count']}`",
+        f"- Skipped: `{metrics['integration_counts']['skipped_count']}`",
+        f"- Failed: `{metrics['integration_counts']['failed_count']}`",
+        f"- Blocked: `{metrics['integration_counts']['blocked_count']}`",
         "",
         "## Blockers",
         "",
@@ -683,6 +713,650 @@ def write_outcome_reports(
     write_json(artifacts / "program_metrics.json", metrics)
     write_status_markdown(program, queue, metrics, artifacts)
     return metrics
+
+
+def normalize_policy_bool(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValidationError(f"{label}: expected boolean")
+    return value
+
+
+def normalize_policy_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{label}: expected non-empty string")
+    return value
+
+
+def normalize_branch_prefixes(value: Any, label: str) -> tuple[str, ...]:
+    prefixes = validate_string_list(value, label, [])
+    if not prefixes:
+        raise ValidationError(f"{label}: expected non-empty list[str]")
+    return tuple(prefix.rstrip("/") + "/" for prefix in prefixes)
+
+
+def load_integration_policy_overrides(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    policy = read_json(path)
+    if not isinstance(policy, dict):
+        raise ValidationError(f"{path}: expected integration policy object")
+    version = policy.get("schema_version")
+    if version != SCHEMA_VERSION:
+        raise ValidationError(
+            f"{path}.schema_version: unsupported schema version {version!r}; "
+            f"expected {SCHEMA_VERSION!r}"
+        )
+    return policy
+
+
+def build_integration_policy(
+    mode: str,
+    repo: Path | None,
+    base_ref: str,
+    branch_prefix: str,
+    policy_path: Path | None = None,
+) -> IntegrationPolicy | None:
+    if mode not in INTEGRATION_MODES:
+        raise ValidationError(f"unsupported integration mode {mode!r}")
+    if mode == "off":
+        return None
+    if repo is None:
+        raise ValidationError("--worktree-repo is required for integration")
+
+    overrides = load_integration_policy_overrides(policy_path)
+    target_base_ref = normalize_policy_string(
+        overrides.get("target_base_ref", base_ref),
+        "integration_policy.target_base_ref",
+    )
+    if mode == "local-merge" and target_base_ref == "HEAD":
+        raise ValidationError(
+            "local-merge integration requires a named target base branch"
+        )
+
+    default_prefix = branch_prefix.rstrip("/") + "/"
+    allowed_prefixes = normalize_branch_prefixes(
+        overrides.get("allowed_branch_prefixes", [default_prefix]),
+        "integration_policy.allowed_branch_prefixes",
+    )
+    require_clean = normalize_policy_bool(
+        overrides.get("require_clean_target", True),
+        "integration_policy.require_clean_target",
+    )
+    allow_fast_forward = normalize_policy_bool(
+        overrides.get("allow_fast_forward", True),
+        "integration_policy.allow_fast_forward",
+    )
+    allow_merge_commit = normalize_policy_bool(
+        overrides.get("allow_merge_commit", True),
+        "integration_policy.allow_merge_commit",
+    )
+    if mode == "local-merge" and not (allow_fast_forward or allow_merge_commit):
+        raise ValidationError(
+            "local-merge integration policy must allow fast-forward or merge commits"
+        )
+
+    return IntegrationPolicy(
+        mode=mode,
+        repo=repo.resolve(),
+        target_base_ref=target_base_ref,
+        allowed_branch_prefixes=allowed_prefixes,
+        require_clean_target=require_clean,
+        allow_fast_forward=allow_fast_forward,
+        allow_merge_commit=allow_merge_commit,
+    )
+
+
+def integration_counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {
+        "total_integration_candidates": 0,
+        "not_requested_count": 0,
+        "ready_count": 0,
+        "merged_count": 0,
+        "skipped_count": 0,
+        "failed_count": 0,
+        "blocked_count": 0,
+    }
+    for task in tasks:
+        is_candidate = (
+            task.get("processed_by") == WORKTREE_PROCESSED_BY
+            or bool(task.get("worktree_branch"))
+            or bool(task.get("worktree_path"))
+            or isinstance(task.get("local_action"), dict)
+            or isinstance(task.get("action"), dict)
+        )
+        if not is_candidate:
+            continue
+        counts["total_integration_candidates"] += 1
+        state = task.get("integration_state") or "NOT_REQUESTED"
+        if state == "READY":
+            counts["ready_count"] += 1
+        elif state == "MERGED":
+            counts["merged_count"] += 1
+        elif state == "SKIPPED":
+            counts["skipped_count"] += 1
+        elif state == "FAILED":
+            counts["failed_count"] += 1
+        elif state == "BLOCKED":
+            counts["blocked_count"] += 1
+        else:
+            counts["not_requested_count"] += 1
+    return counts
+
+
+def integration_task_candidates(queue: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        task
+        for task in queue.get("tasks", [])
+        if (
+            task.get("processed_by") == WORKTREE_PROCESSED_BY
+            or bool(task.get("worktree_branch"))
+            or bool(task.get("worktree_path"))
+            or isinstance(task.get("local_action"), dict)
+            or isinstance(task.get("action"), dict)
+        )
+    ]
+
+
+def git_repo_root(repo: Path) -> Path:
+    result = run_git(repo, ["rev-parse", "--show-toplevel"], check=True)
+    return Path(result.stdout.strip())
+
+
+def git_is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    return run_git(
+        repo,
+        ["merge-base", "--is-ancestor", ancestor, descendant],
+        check=False,
+    ).returncode == 0
+
+
+def current_ref_sha(repo: Path, ref: str) -> str:
+    return run_git(repo, ["rev-parse", "--verify", ref], check=True).stdout.strip()
+
+
+def branch_exists(repo: Path, branch: str) -> bool:
+    return run_git(
+        repo,
+        ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        check=False,
+    ).returncode == 0
+
+
+def task_branch_allowed(branch: str, policy: IntegrationPolicy) -> bool:
+    return any(branch.startswith(prefix) for prefix in policy.allowed_branch_prefixes)
+
+
+def read_task_worktree_metadata(task: dict[str, Any], artifacts: Path) -> dict[str, Any] | None:
+    task_id = task["id"]
+    metadata_path = artifacts / task_id / WORKTREE_METADATA_ARTIFACT
+    if not metadata_path.exists() or metadata_path.stat().st_size == 0:
+        return None
+    try:
+        metadata = read_json(metadata_path)
+    except ValidationError:
+        return None
+    return metadata if isinstance(metadata, dict) else None
+
+
+def integration_record(
+    task: dict[str, Any],
+    policy: IntegrationPolicy,
+    target_base_sha_before: str,
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "task_id": task.get("id"),
+        "integration_mode": policy.mode,
+        "base_ref": policy.target_base_ref,
+        "base_sha_before": target_base_sha_before,
+        "base_sha_after": target_base_sha_before,
+        "task_branch": (
+            task.get("worktree_branch")
+            or (metadata or {}).get("branch_name")
+        ),
+        "task_commit_sha": (
+            task.get("worktree_commit_sha")
+            or (metadata or {}).get("commit_sha")
+        ),
+        "merge_commit_sha": None,
+        "fast_forward": False,
+        "conflict_diagnostics": [],
+        "skipped_reasons": [],
+        "final_integration_state": "NOT_REQUESTED",
+    }
+
+
+def finish_integration_record(
+    record: dict[str, Any],
+    state: str,
+    base_sha_after: str,
+    reasons: list[str] | None = None,
+    diagnostics: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    record["final_integration_state"] = state
+    record["base_sha_after"] = base_sha_after
+    if reasons:
+        record["skipped_reasons"] = reasons
+    if diagnostics:
+        record["conflict_diagnostics"] = diagnostics
+    return record
+
+
+def record_task_integration(task: dict[str, Any], record: dict[str, Any]) -> None:
+    state = str(record["final_integration_state"])
+    task["integration_state"] = state
+    task["integration_mode"] = record["integration_mode"]
+    task["integration_base_ref"] = record["base_ref"]
+    if isinstance(record.get("task_branch"), str):
+        task["integration_task_branch"] = record["task_branch"]
+    if is_commit_sha(record.get("task_commit_sha")):
+        task["integration_task_commit_sha"] = record["task_commit_sha"]
+    if is_commit_sha(record.get("merge_commit_sha")):
+        task["integration_sha"] = record["merge_commit_sha"]
+    elif state != "MERGED":
+        task.pop("integration_sha", None)
+
+
+def write_task_integration_artifact(
+    artifacts: Path,
+    task_id: str,
+    record: dict[str, Any],
+) -> None:
+    write_json(artifacts / task_id / INTEGRATION_ARTIFACT, record)
+
+
+def reusable_terminal_integration_record(
+    artifacts: Path,
+    task: dict[str, Any],
+    policy: IntegrationPolicy,
+    repo_root: Path,
+    target_base_sha_before: str,
+) -> dict[str, Any] | None:
+    integration_state = task.get("integration_state")
+    if integration_state not in TERMINAL_INTEGRATION_STATES:
+        return None
+    integration_path = artifacts / task["id"] / INTEGRATION_ARTIFACT
+    if not integration_path.exists():
+        return None
+    existing = read_artifact_object(integration_path, [])
+    if existing is None:
+        return None
+    task_commit = existing.get("task_commit_sha")
+    merge_sha = existing.get("merge_commit_sha")
+    if (
+        existing.get("integration_mode") != policy.mode
+        or existing.get("final_integration_state") != integration_state
+        or existing.get("base_ref") != policy.target_base_ref
+        or task_commit != task.get("worktree_commit_sha")
+    ):
+        return None
+    if integration_state != "MERGED":
+        return existing
+    if (
+        not is_commit_sha(task_commit)
+        or not is_commit_sha(merge_sha)
+        or not git_is_ancestor(repo_root, task_commit, target_base_sha_before)
+    ):
+        return None
+    return existing
+
+
+def integration_event_key(event: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        event.get("task_id"),
+        event.get("integration_mode"),
+        event.get("task_commit_sha"),
+        event.get("merge_commit_sha"),
+        event.get("final_integration_state"),
+    )
+
+
+def append_integration_event_once(artifacts: Path, record: dict[str, Any]) -> bool:
+    events_path = artifacts / INTEGRATION_EVENTS_ARTIFACT
+    existing = read_ndjson(events_path) if events_path.exists() else []
+    event = {
+        "schema_version": SCHEMA_VERSION,
+        "ts": utc_now(),
+        "type": "TASK_INTEGRATION",
+        "task_id": record.get("task_id"),
+        "integration_mode": record.get("integration_mode"),
+        "base_ref": record.get("base_ref"),
+        "task_branch": record.get("task_branch"),
+        "task_commit_sha": record.get("task_commit_sha"),
+        "merge_commit_sha": record.get("merge_commit_sha"),
+        "final_integration_state": record.get("final_integration_state"),
+        "skipped_reasons": record.get("skipped_reasons", []),
+    }
+    key = integration_event_key(event)
+    if any(integration_event_key(existing_event) == key for existing_event in existing):
+        return False
+    artifacts.mkdir(parents=True, exist_ok=True)
+    with events_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(event) + "\n")
+    return True
+
+
+def classify_integration_candidate(
+    task: dict[str, Any],
+    artifacts: Path,
+    policy: IntegrationPolicy,
+    repo_root: Path,
+    target_base_sha_before: str,
+    target_dirty_status: list[str],
+) -> tuple[dict[str, Any], bool]:
+    metadata = read_task_worktree_metadata(task, artifacts)
+    record = integration_record(task, policy, target_base_sha_before, metadata)
+    reasons: list[str] = []
+    state = "FAILED"
+
+    if task.get("state") != "DONE":
+        reasons.append("task is not DONE")
+        validation = read_artifact_object(artifacts / task["id"] / "validation.json", [])
+        if validation and validation.get("passed") is False:
+            reasons.append("validation failed")
+        state = "SKIPPED"
+    elif task.get("processed_by") != WORKTREE_PROCESSED_BY:
+        reasons.append("task was not processed by the worktree executor")
+        state = "SKIPPED"
+
+    if reasons:
+        current_base = current_ref_sha(repo_root, policy.target_base_ref)
+        return finish_integration_record(record, state, current_base, reasons), False
+
+    task_errors = verify_task_artifacts(task, artifacts)
+    if task_errors:
+        current_base = current_ref_sha(repo_root, policy.target_base_ref)
+        reasons = [f"artifact integrity failed: {error}" for error in task_errors]
+        if any("actual HEAD mismatch" in error for error in task_errors):
+            reasons.insert(0, "task branch is ambiguous")
+        return finish_integration_record(
+            record,
+            "FAILED",
+            current_base,
+            reasons,
+        ), False
+
+    if metadata is None:
+        current_base = current_ref_sha(repo_root, policy.target_base_ref)
+        return finish_integration_record(
+            record,
+            "FAILED",
+            current_base,
+            [f"missing {WORKTREE_METADATA_ARTIFACT}"],
+        ), False
+
+    validation = metadata.get("validation_output")
+    if not isinstance(validation, dict) or validation.get("passed") is not True:
+        current_base = current_ref_sha(repo_root, policy.target_base_ref)
+        return finish_integration_record(
+            record,
+            "FAILED",
+            current_base,
+            ["validation failed"],
+        ), False
+
+    branch = record.get("task_branch")
+    commit_sha = record.get("task_commit_sha")
+    if not isinstance(branch, str) or not branch.strip():
+        reasons.append("missing task branch")
+    elif not task_branch_allowed(branch, policy):
+        reasons.append("task branch is not allowed by integration policy")
+    elif not branch_exists(repo_root, branch):
+        reasons.append("task branch does not exist")
+
+    if not is_commit_sha(commit_sha):
+        reasons.append("missing task commit SHA")
+    base_sha = metadata.get("base_sha")
+    if not is_commit_sha(base_sha):
+        reasons.append("missing task base SHA")
+
+    if not reasons and isinstance(branch, str) and is_commit_sha(commit_sha):
+        branch_head = current_ref_sha(repo_root, branch)
+        if branch_head != commit_sha:
+            reasons.append("task branch is ambiguous: branch head does not match task commit")
+
+    if not reasons and is_commit_sha(base_sha) and is_commit_sha(commit_sha):
+        if not git_is_ancestor(repo_root, base_sha, commit_sha):
+            reasons.append("task branch is ambiguous: task commit is not based on recorded base")
+        else:
+            ahead_count = int(
+                run_git(
+                    repo_root,
+                    ["rev-list", "--count", f"{base_sha}..{commit_sha}"],
+                    check=True,
+                ).stdout.strip()
+                or "0"
+            )
+            if ahead_count != 1:
+                reasons.append(
+                    "task branch is ambiguous: expected exactly one task commit"
+                )
+
+    already_contains_task = (
+        is_commit_sha(commit_sha)
+        and git_is_ancestor(repo_root, str(commit_sha), target_base_sha_before)
+    )
+    if (
+        not reasons
+        and is_commit_sha(base_sha)
+        and target_base_sha_before != base_sha
+        and not already_contains_task
+    ):
+        return finish_integration_record(
+            record,
+            "BLOCKED",
+            current_ref_sha(repo_root, policy.target_base_ref),
+            ["target base moved unexpectedly"],
+        ), False
+
+    if not reasons and policy.require_clean_target and target_dirty_status:
+        return finish_integration_record(
+            record,
+            "BLOCKED",
+            current_ref_sha(repo_root, policy.target_base_ref),
+            ["target repo is not clean"],
+            [{"status": target_dirty_status}],
+        ), False
+
+    if reasons:
+        return finish_integration_record(
+            record,
+            "FAILED",
+            current_ref_sha(repo_root, policy.target_base_ref),
+            reasons,
+        ), False
+
+    return record, True
+
+
+def merge_integration_candidate(
+    task: dict[str, Any],
+    record: dict[str, Any],
+    policy: IntegrationPolicy,
+    repo_root: Path,
+) -> dict[str, Any]:
+    branch = str(record["task_branch"])
+    commit_sha = str(record["task_commit_sha"])
+    current_base = current_ref_sha(repo_root, policy.target_base_ref)
+    if git_is_ancestor(repo_root, commit_sha, current_base):
+        record["merge_commit_sha"] = current_base
+        return finish_integration_record(record, "MERGED", current_base)
+
+    if policy.allow_fast_forward and git_is_ancestor(repo_root, current_base, commit_sha):
+        result = run_git(repo_root, ["merge", "--ff-only", branch], check=False)
+        if result.returncode == 0:
+            merged_sha = current_ref_sha(repo_root, policy.target_base_ref)
+            record["merge_commit_sha"] = merged_sha
+            record["fast_forward"] = True
+            return finish_integration_record(record, "MERGED", merged_sha)
+        diagnostics = [{"merge_command": result.as_dict()}]
+        return finish_integration_record(
+            record,
+            "BLOCKED",
+            current_ref_sha(repo_root, policy.target_base_ref),
+            ["fast-forward merge failed"],
+            diagnostics,
+        )
+
+    if not policy.allow_merge_commit:
+        return finish_integration_record(
+            record,
+            "BLOCKED",
+            current_base,
+            ["merge commit is not allowed by integration policy"],
+        )
+
+    result = run_git(repo_root, ["merge", "--no-ff", "--no-edit", branch], check=False)
+    if result.returncode == 0:
+        merged_sha = current_ref_sha(repo_root, policy.target_base_ref)
+        record["merge_commit_sha"] = merged_sha
+        record["fast_forward"] = False
+        return finish_integration_record(record, "MERGED", merged_sha)
+
+    status = git_status_lines(repo_root)
+    unmerged_paths = [
+        line.strip()
+        for line in run_git(
+            repo_root,
+            ["diff", "--name-only", "--diff-filter=U"],
+            check=False,
+        ).stdout.splitlines()
+        if line.strip()
+    ]
+    abort_result = run_git(repo_root, ["merge", "--abort"], check=False)
+    diagnostics = [
+        {
+            "merge_command": result.as_dict(),
+            "status": status,
+            "unmerged_paths": unmerged_paths,
+            "abort_command": abort_result.as_dict(),
+        }
+    ]
+    return finish_integration_record(
+        record,
+        "BLOCKED",
+        current_ref_sha(repo_root, policy.target_base_ref),
+        ["merge conflict"],
+        diagnostics,
+    )
+
+
+def write_integration_report(
+    artifacts: Path,
+    policy: IntegrationPolicy,
+    target_base_sha_before: str,
+    target_base_sha_after: str,
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    counts = {
+        "ready_count": sum(1 for item in records if item["final_integration_state"] == "READY"),
+        "merged_count": sum(1 for item in records if item["final_integration_state"] == "MERGED"),
+        "skipped_count": sum(
+            1 for item in records if item["final_integration_state"] == "SKIPPED"
+        ),
+        "failed_count": sum(1 for item in records if item["final_integration_state"] == "FAILED"),
+        "blocked_count": sum(
+            1 for item in records if item["final_integration_state"] == "BLOCKED"
+        ),
+    }
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "integration_mode": policy.mode,
+        "base_ref": policy.target_base_ref,
+        "base_sha_before": target_base_sha_before,
+        "base_sha_after": target_base_sha_after,
+        "candidate_count": len(records),
+        **counts,
+        "task_results": [
+            {
+                "task_id": record["task_id"],
+                "final_integration_state": record["final_integration_state"],
+                "task_branch": record.get("task_branch"),
+                "task_commit_sha": record.get("task_commit_sha"),
+                "merge_commit_sha": record.get("merge_commit_sha"),
+                "skipped_reasons": record.get("skipped_reasons", []),
+                "conflict_diagnostics": record.get("conflict_diagnostics", []),
+            }
+            for record in records
+        ],
+    }
+    write_json(artifacts / INTEGRATION_REPORT_ARTIFACT, report)
+    return report
+
+
+def integrate_completed_tasks(
+    queue: dict[str, Any],
+    queue_file: Path,
+    artifacts: Path,
+    policy: IntegrationPolicy,
+) -> dict[str, Any]:
+    repo_root = git_repo_root(policy.repo)
+    if policy.mode == "local-merge":
+        dirty_before_switch = git_status_lines(repo_root)
+        if dirty_before_switch and policy.require_clean_target:
+            target_dirty_status = dirty_before_switch
+        else:
+            run_git(repo_root, ["switch", policy.target_base_ref], check=True)
+            target_dirty_status = git_status_lines(repo_root)
+    else:
+        target_dirty_status = git_status_lines(repo_root)
+
+    target_base_sha_before = current_ref_sha(repo_root, policy.target_base_ref)
+    records: list[dict[str, Any]] = []
+    for task in integration_task_candidates(queue):
+        reusable_record = reusable_terminal_integration_record(
+            artifacts,
+            task,
+            policy,
+            repo_root,
+            target_base_sha_before,
+        )
+        if reusable_record is not None:
+            records.append(reusable_record)
+            continue
+
+        record, eligible = classify_integration_candidate(
+            task,
+            artifacts,
+            policy,
+            repo_root,
+            target_base_sha_before,
+            target_dirty_status,
+        )
+        if eligible and policy.mode == "report-only":
+            record = finish_integration_record(
+                record,
+                "READY",
+                current_ref_sha(repo_root, policy.target_base_ref),
+            )
+        elif eligible and policy.mode == "local-merge":
+            record = merge_integration_candidate(task, record, policy, repo_root)
+
+        record_task_integration(task, record)
+        write_task_integration_artifact(artifacts, task["id"], record)
+        append_integration_event_once(artifacts, record)
+        records.append(record)
+
+    target_base_sha_after = current_ref_sha(repo_root, policy.target_base_ref)
+    report = write_integration_report(
+        artifacts,
+        policy,
+        target_base_sha_before,
+        target_base_sha_after,
+        records,
+    )
+    write_json(queue_file, queue)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "integration_mode": policy.mode,
+        "base_ref": policy.target_base_ref,
+        "base_sha_before": target_base_sha_before,
+        "base_sha_after": target_base_sha_after,
+        "target_dirty_status": target_dirty_status,
+        "report": report,
+        "records": records,
+    }
 
 
 def read_ndjson(path: Path) -> list[dict[str, Any]]:
@@ -1050,6 +1724,65 @@ def verify_worktree_metadata(
             errors.append(f"artifacts/{task_id}: FAILED task has worktree_commit_sha")
 
 
+def verify_integration_artifact(
+    task: dict[str, Any],
+    task_dir: Path,
+    errors: list[str],
+) -> None:
+    task_id = task["id"]
+    integration_state = task.get("integration_state")
+    integration_path = task_dir / INTEGRATION_ARTIFACT
+    if integration_state is None and not integration_path.exists():
+        return
+
+    if integration_state not in INTEGRATION_STATES:
+        errors.append(f"artifacts/{task_id}: invalid integration_state")
+    if not integration_path.exists():
+        errors.append(f"artifacts/{task_id}/{INTEGRATION_ARTIFACT}: missing integration metadata")
+        return
+    if integration_path.stat().st_size == 0:
+        errors.append(f"artifacts/{task_id}/{INTEGRATION_ARTIFACT}: artifact is empty")
+        return
+
+    integration = read_artifact_object(integration_path, errors)
+    if integration is None:
+        return
+    label = f"artifacts/{task_id}/{INTEGRATION_ARTIFACT}"
+    if integration.get("schema_version") != SCHEMA_VERSION:
+        errors.append(f"{label}: unsupported schema version")
+    if integration.get("task_id") != task_id:
+        errors.append(f"{label}: task_id mismatch")
+    if integration.get("integration_mode") not in ACTIVE_INTEGRATION_MODES:
+        errors.append(f"{label}: invalid integration mode")
+    if integration.get("integration_mode") != task.get("integration_mode"):
+        errors.append(f"{label}: integration mode mismatch")
+    if integration.get("final_integration_state") != integration_state:
+        errors.append(f"{label}: final integration state mismatch")
+    if integration.get("base_ref") != task.get("integration_base_ref"):
+        errors.append(f"{label}: base ref mismatch")
+    if integration.get("task_branch") != task.get("integration_task_branch"):
+        errors.append(f"{label}: task branch mismatch")
+    if integration.get("task_commit_sha") != task.get("integration_task_commit_sha"):
+        errors.append(f"{label}: task commit mismatch")
+
+    if integration_state in {"READY", "MERGED"}:
+        if task.get("state") != "DONE":
+            errors.append(f"{label}: integrated task is not DONE")
+        if task.get("processed_by") != WORKTREE_PROCESSED_BY:
+            errors.append(f"{label}: integrated task was not worktree processed")
+        if not is_commit_sha(task.get("worktree_commit_sha")):
+            errors.append(f"{label}: integrated task missing task commit SHA")
+
+    if integration_state == "MERGED":
+        merge_sha = integration.get("merge_commit_sha")
+        if not is_commit_sha(merge_sha):
+            errors.append(f"{label}: MERGED integration missing merge SHA")
+        if task.get("integration_sha") != merge_sha:
+            errors.append(f"{label}: merge SHA mismatch")
+    elif "integration_sha" in task:
+        errors.append(f"{label}: non-MERGED task has integration_sha")
+
+
 def verify_task_artifacts(task: dict[str, Any], artifacts: Path) -> list[str]:
     errors: list[str] = []
     task_id = task["id"]
@@ -1082,6 +1815,7 @@ def verify_task_artifacts(task: dict[str, Any], artifacts: Path) -> list[str]:
 
     if task.get("processed_by") == WORKTREE_PROCESSED_BY:
         verify_worktree_metadata(task, task_dir, errors)
+    verify_integration_artifact(task, task_dir, errors)
 
     events_path = task_dir / "events.ndjson"
     if events_path.exists():
@@ -1115,6 +1849,124 @@ def verify_task_artifacts(task: dict[str, Any], artifacts: Path) -> list[str]:
                 previous_to_state = event.get("to_state")
 
     return errors
+
+
+def verify_integration_report_artifacts(
+    queue: dict[str, Any],
+    artifacts: Path,
+    errors: list[str],
+) -> None:
+    tasks = queue.get("tasks", [])
+    has_integration = any(task.get("integration_state") for task in tasks)
+    require_events = has_integration
+    report_path = artifacts / INTEGRATION_REPORT_ARTIFACT
+    events_path = artifacts / INTEGRATION_EVENTS_ARTIFACT
+    if not has_integration and not report_path.exists() and not events_path.exists():
+        return
+
+    if not report_path.exists():
+        errors.append(f"{report_path}: missing integration report")
+    elif report_path.stat().st_size == 0:
+        errors.append(f"{report_path}: artifact is empty")
+    else:
+        report = read_artifact_object(report_path, errors)
+        if report is not None:
+            if report.get("schema_version") != SCHEMA_VERSION:
+                errors.append(f"{report_path}: unsupported schema version")
+            if report.get("integration_mode") not in ACTIVE_INTEGRATION_MODES:
+                errors.append(f"{report_path}: invalid integration mode")
+            expected = integration_counts(tasks)
+            if report.get("candidate_count") != expected["total_integration_candidates"]:
+                errors.append(
+                    f"{report_path}: candidate_count={report.get('candidate_count')!r}, "
+                    f"expected {expected['total_integration_candidates']!r}"
+                )
+            for report_field, expected_field in (
+                ("ready_count", "ready_count"),
+                ("merged_count", "merged_count"),
+                ("skipped_count", "skipped_count"),
+                ("failed_count", "failed_count"),
+                ("blocked_count", "blocked_count"),
+            ):
+                if report.get(report_field) != expected[expected_field]:
+                    errors.append(
+                        f"{report_path}: {report_field}={report.get(report_field)!r}, "
+                        f"expected {expected[expected_field]!r}"
+                    )
+            task_results = report.get("task_results")
+            if not isinstance(task_results, list):
+                errors.append(f"{report_path}: task_results must be list")
+            if report.get("candidate_count"):
+                require_events = True
+            if isinstance(task_results, list):
+                candidates = integration_task_candidates(queue)
+                if len(task_results) != len(candidates):
+                    errors.append(
+                        f"{report_path}: task_results length={len(task_results)!r}, "
+                        f"expected {len(candidates)!r}"
+                    )
+                expected_by_id = {
+                    task.get("id"): task
+                    for task in candidates
+                    if isinstance(task.get("id"), str)
+                }
+                seen_task_ids: set[str] = set()
+                for index, result in enumerate(task_results):
+                    result_label = f"{report_path}.task_results[{index}]"
+                    if not isinstance(result, dict):
+                        errors.append(f"{result_label}: expected object")
+                        continue
+                    task_id = result.get("task_id")
+                    if not isinstance(task_id, str) or task_id not in expected_by_id:
+                        errors.append(f"{result_label}: unexpected task_id")
+                        continue
+                    if task_id in seen_task_ids:
+                        errors.append(f"{result_label}: duplicate task_id")
+                    seen_task_ids.add(task_id)
+                    task = expected_by_id[task_id]
+                    field_pairs = (
+                        ("final_integration_state", "integration_state"),
+                        ("task_branch", "integration_task_branch"),
+                        ("task_commit_sha", "integration_task_commit_sha"),
+                        ("merge_commit_sha", "integration_sha"),
+                    )
+                    for result_field, task_field in field_pairs:
+                        expected_value = task.get(task_field)
+                        actual_value = result.get(result_field)
+                        if result_field == "merge_commit_sha" and expected_value is None:
+                            if actual_value is not None:
+                                errors.append(f"{result_label}: merge_commit_sha mismatch")
+                            continue
+                        if actual_value != expected_value:
+                            errors.append(f"{result_label}: {result_field} mismatch")
+
+    if not require_events and not events_path.exists():
+        return
+
+    if not events_path.exists():
+        errors.append(f"{events_path}: missing integration events")
+    elif events_path.stat().st_size == 0:
+        errors.append(f"{events_path}: artifact is empty")
+    else:
+        try:
+            events = read_ndjson(events_path)
+        except ValidationError as exc:
+            errors.append(str(exc))
+            events = []
+        seen_keys: set[tuple[Any, ...]] = set()
+        for index, event in enumerate(events):
+            label = f"{events_path}[{index}]"
+            validate_event_metadata(event, label, errors, ("ts",))
+            if event.get("type") != "TASK_INTEGRATION":
+                errors.append(f"{label}: invalid event type")
+            if event.get("integration_mode") not in ACTIVE_INTEGRATION_MODES:
+                errors.append(f"{label}: invalid integration mode")
+            if event.get("final_integration_state") not in INTEGRATION_STATES:
+                errors.append(f"{label}: invalid final integration state")
+            key = integration_event_key(event)
+            if key in seen_keys:
+                errors.append(f"{label}: duplicate integration event")
+            seen_keys.add(key)
 
 
 def verify_artifact_integrity(
@@ -1156,6 +2008,10 @@ def verify_artifact_integrity(
                         f"{metrics_path}: {field}={metrics.get(field)!r}, "
                         f"expected {expected!r}"
                     )
+            if "integration_counts" in metrics and metrics.get(
+                "integration_counts"
+            ) != integration_counts(queue.get("tasks", [])):
+                errors.append(f"{metrics_path}: integration_counts does not match final state")
 
     status_path = artifacts / "roadmap_status.md"
     if status_path.exists():
@@ -1189,6 +2045,14 @@ def verify_artifact_integrity(
             WORKTREE_PROCESSED_BY,
         }:
             errors.extend(verify_task_artifacts(task, artifacts))
+        elif task.get("integration_state"):
+            task_dir = artifacts / task["id"]
+            if not task_dir.is_dir():
+                errors.append(f"artifacts/{task['id']}: missing integration task directory")
+            else:
+                verify_integration_artifact(task, task_dir, errors)
+
+    verify_integration_report_artifacts(queue, artifacts, errors)
 
     return errors
 
@@ -1205,7 +2069,9 @@ def summarize_status(
         "program_state": program.get("program_state"),
         "roadmap_backlog_count": len(program.get("roadmap_backlog") or []),
         "review_log_count": len(program.get("review_log") or []),
+        "task_execution_counts": queue_counts(tasks),
         "queue_counts": queue_counts(tasks),
+        "integration_counts": integration_counts(tasks),
         "task_ids": [task.get("id") for task in tasks],
     }
     if artifacts is not None:
@@ -1248,6 +2114,7 @@ def run_program(
     dry_run: bool = False,
     review_only: bool = False,
     worktree_config: WorktreeConfig | None = None,
+    integration_policy: IntegrationPolicy | None = None,
 ) -> dict[str, Any]:
     run_started_ts = utc_now()
     loaded_program, loaded_queue = load_validated_inputs(program_file, queue_file)
@@ -1303,6 +2170,7 @@ def run_program(
 
     metrics: dict[str, Any] | None = None
     integrity_errors: list[str] = []
+    integration_summary: dict[str, Any] | None = None
     if not dry_run:
         write_json(program_file, program)
         metrics = write_outcome_reports(program, queue, artifacts, review_entry, run_started_ts)
@@ -1311,6 +2179,25 @@ def run_program(
             raise ValidationError(
                 format_validation_errors("Artifact integrity check failed", integrity_errors)
             )
+        if integration_policy is not None:
+            if worktree_config is None:
+                raise ValidationError("integration requires --execution-mode worktree")
+            integration_summary = integrate_completed_tasks(
+                queue=queue,
+                queue_file=queue_file,
+                artifacts=artifacts,
+                policy=integration_policy,
+            )
+            queue = read_json(queue_file)
+            metrics = write_outcome_reports(program, queue, artifacts, review_entry, run_started_ts)
+            integrity_errors = verify_artifact_integrity(program, queue, artifacts)
+            if integrity_errors:
+                raise ValidationError(
+                    format_validation_errors(
+                        "Artifact integrity check failed",
+                        integrity_errors,
+                    )
+                )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1328,6 +2215,7 @@ def run_program(
             review_entry.get("reopened_task_ids", []) if review_entry else []
         ),
         "worker_summary": worker_summary,
+        "integration_summary": integration_summary,
         "metrics": metrics,
         "artifact_integrity_errors": integrity_errors,
     }
@@ -1353,6 +2241,29 @@ def add_worktree_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--worktrees-dir", type=Path)
     parser.add_argument("--worktree-base-ref", default="HEAD")
     parser.add_argument("--worktree-branch-prefix", default="codex/local-agent-loop")
+
+
+def add_integration_args(
+    parser: argparse.ArgumentParser,
+    *,
+    default_mode: str,
+    include_off: bool,
+) -> None:
+    choices = sorted(INTEGRATION_MODES if include_off else ACTIVE_INTEGRATION_MODES)
+    parser.add_argument(
+        "--integration-mode",
+        choices=choices,
+        default=default_mode,
+        help=(
+            "Run the v0.6 integration phase. local-merge mutates the target "
+            "base branch and must be selected explicitly."
+        ),
+    )
+    parser.add_argument(
+        "--integration-policy",
+        type=Path,
+        help="Optional local integration policy JSON contract",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1388,6 +2299,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run roadmap review and reporting without invoking the worker",
     )
     add_worktree_args(program_parser)
+    add_integration_args(program_parser, default_mode="off", include_off=True)
+
+    integration_parser = subparsers.add_parser(
+        "integrate",
+        help="Run the v0.6 integration phase for completed worktree tasks",
+    )
+    integration_parser.add_argument("--program", type=Path, required=True)
+    integration_parser.add_argument("--queue", type=Path, required=True)
+    integration_parser.add_argument("--artifacts", type=Path, required=True)
+    integration_parser.add_argument("--worktree-repo", type=Path, required=True)
+    integration_parser.add_argument("--worktree-base-ref", default="main")
+    integration_parser.add_argument(
+        "--worktree-branch-prefix",
+        default="codex/local-agent-loop",
+    )
+    add_integration_args(integration_parser, default_mode="report-only", include_off=False)
 
     status_parser = subparsers.add_parser("status", help="Print compact program status")
     status_parser.add_argument("--program", type=Path, required=True)
@@ -1445,6 +2372,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.worktree_base_ref,
                 args.worktree_branch_prefix,
             )
+            integration_policy = build_integration_policy(
+                args.integration_mode,
+                args.worktree_repo,
+                args.worktree_base_ref,
+                args.worktree_branch_prefix,
+                args.integration_policy,
+            )
             summary = run_program(
                 program_file=args.program,
                 queue_file=args.queue,
@@ -1455,7 +2389,46 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 review_only=args.review_only,
                 worktree_config=worktree_config,
+                integration_policy=integration_policy,
             )
+        elif args.command == "integrate":
+            program, queue = load_validated_inputs(args.program, args.queue)
+            policy = build_integration_policy(
+                args.integration_mode,
+                args.worktree_repo,
+                args.worktree_base_ref,
+                args.worktree_branch_prefix,
+                args.integration_policy,
+            )
+            if policy is None:
+                raise ValidationError("integrate requires an active integration mode")
+            summary = integrate_completed_tasks(
+                queue=queue,
+                queue_file=args.queue,
+                artifacts=args.artifacts,
+                policy=policy,
+            )
+            metrics = write_outcome_reports(
+                program,
+                read_json(args.queue),
+                args.artifacts,
+                None,
+                utc_now(),
+            )
+            summary["metrics"] = metrics
+            integrity_errors = verify_artifact_integrity(
+                program,
+                read_json(args.queue),
+                args.artifacts,
+            )
+            summary["artifact_integrity_errors"] = integrity_errors
+            if integrity_errors:
+                raise ValidationError(
+                    format_validation_errors(
+                        "Artifact integrity check failed",
+                        integrity_errors,
+                    )
+                )
         elif args.command == "status":
             program, queue = load_validated_inputs(args.program, args.queue)
             summary = summarize_status(program, queue, args.artifacts)
