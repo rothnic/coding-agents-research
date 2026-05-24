@@ -187,6 +187,20 @@ def worktree_config(repo: Path, worktrees_dir: Path) -> local_agent_loop_v0.Work
     )
 
 
+def integration_policy(
+    repo: Path,
+    mode: str = "report-only",
+) -> local_program_loop_v0.IntegrationPolicy:
+    policy = local_program_loop_v0.build_integration_policy(
+        mode,
+        repo,
+        "main",
+        "codex/local-agent-loop",
+    )
+    require(policy is not None, "integration policy was not created")
+    return policy
+
+
 def worktree_branch(task_id: str, cfg: local_agent_loop_v0.WorktreeConfig) -> str:
     return local_agent_loop_v0.worktree_branch_name(task_id, cfg)
 
@@ -2233,6 +2247,634 @@ def scenario_deterministic_validation_evidence_integrity() -> dict[str, Any]:
         return result
 
 
+def scenario_report_only_integration() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="integration-report-only-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-report-only-integration"
+        queue_out, program_file, queue_file, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id),
+            repo,
+            worktrees,
+        )
+        main_before = git_stdout(repo, ["rev-parse", "main"])
+        summary = local_program_loop_v0.integrate_completed_tasks(
+            queue=queue_out,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            policy=integration_policy(repo, "report-only"),
+        )
+        main_after = git_stdout(repo, ["rev-parse", "main"])
+        queue_after = read_json(queue_file)
+        integration_path = artifacts / f"{task_id}/integration.json"
+        integration_after_first = integration_path.read_text(encoding="utf-8")
+        events_after_first = read_ndjson(artifacts / "integration_events.ndjson")
+        local_program_loop_v0.integrate_completed_tasks(
+            queue=queue_after,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            policy=integration_policy(repo, "report-only"),
+        )
+        queue_after = read_json(queue_file)
+        integration_after_second = integration_path.read_text(encoding="utf-8")
+        events_after_second = read_ndjson(artifacts / "integration_events.ndjson")
+        local_program_loop_v0.write_outcome_reports(
+            read_json(program_file),
+            queue_after,
+            artifacts,
+            None,
+            local_program_loop_v0.utc_now(),
+        )
+        integration = read_json(integration_path)
+        report = read_json(artifacts / "integration_report.json")
+        status = local_program_loop_v0.summarize_status(
+            read_json(program_file),
+            queue_after,
+            artifacts,
+        )
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_after,
+            artifacts,
+        )
+        result = {
+            "integration_mode": summary["integration_mode"],
+            "main_unchanged": main_before == main_after,
+            "task_integration_state": queue_after["tasks"][0]["integration_state"],
+            "artifact_state": integration["final_integration_state"],
+            "merge_sha": integration["merge_commit_sha"],
+            "report_ready_count": report["ready_count"],
+            "event_count_after_first": len(events_after_first),
+            "event_count_after_second": len(events_after_second),
+            "integration_artifact_stable": integration_after_first == integration_after_second,
+            "status_ready_count": status["integration_counts"]["ready_count"],
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["integration_mode"] == "report-only", "wrong integration mode")
+        require(result["main_unchanged"], "report-only mutated target main")
+        require(result["task_integration_state"] == "READY", "task was not marked ready")
+        require(result["artifact_state"] == "READY", "artifact was not marked ready")
+        require(result["merge_sha"] is None, "report-only recorded a merge SHA")
+        require(result["report_ready_count"] == 1, "report did not count ready task")
+        require(result["event_count_after_first"] == 1, "report-only did not record one event")
+        require(
+            result["event_count_after_second"] == result["event_count_after_first"],
+            "report-only rerun duplicated integration event",
+        )
+        require(result["integration_artifact_stable"], "report-only artifact changed on rerun")
+        require(result["status_ready_count"] == 1, "status did not expose ready count")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_local_merge_integration_idempotency() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="integration-local-merge-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        state = tmp_dir / "state"
+        init_fixture_repo(repo)
+        task_id = "task-local-merge-integration"
+        program_file = state / "program.json"
+        queue_file = state / "queue.json"
+        artifacts = state / "artifacts"
+        cfg = worktree_config(repo, worktrees)
+        policy = integration_policy(repo, "local-merge")
+        write_json(program_file, worktree_program_doc("program-local-merge"))
+        write_json(queue_file, queue_doc([command_backed_task(task_id)]))
+
+        first = local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=1,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=cfg,
+            integration_policy=policy,
+        )
+        queue_first = read_json(queue_file)
+        integration_path = artifacts / f"{task_id}/integration.json"
+        integration_after_first = integration_path.read_text(encoding="utf-8")
+        events_after_first = read_ndjson(artifacts / "integration_events.ndjson")
+        branch = worktree_branch(task_id, cfg)
+        main_count_after_first = int(git_stdout(repo, ["rev-list", "--count", "main"]))
+        branch_count_after_first = int(git_stdout(repo, ["rev-list", "--count", branch]))
+
+        second = local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=1,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=cfg,
+            integration_policy=policy,
+        )
+        queue_second = read_json(queue_file)
+        integration_after_second = integration_path.read_text(encoding="utf-8")
+        events_after_second = read_ndjson(artifacts / "integration_events.ndjson")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_second,
+            artifacts,
+        )
+        result = {
+            "first_mode": first["integration_summary"]["integration_mode"],
+            "second_mode": second["integration_summary"]["integration_mode"],
+            "task_state": queue_second["tasks"][0]["state"],
+            "integration_state": queue_second["tasks"][0]["integration_state"],
+            "merge_sha_valid": local_program_loop_v0.is_commit_sha(
+                queue_second["tasks"][0].get("integration_sha")
+            ),
+            "main_equals_task_commit": (
+                git_stdout(repo, ["rev-parse", "main"])
+                == queue_second["tasks"][0]["worktree_commit_sha"]
+            ),
+            "main_count_after_first": main_count_after_first,
+            "main_count_after_second": int(git_stdout(repo, ["rev-list", "--count", "main"])),
+            "branch_count_after_first": branch_count_after_first,
+            "branch_count_after_second": int(git_stdout(repo, ["rev-list", "--count", branch])),
+            "integration_event_count_after_first": len(events_after_first),
+            "integration_event_count_after_second": len(events_after_second),
+            "integration_artifact_stable": integration_after_first == integration_after_second,
+            "worktree_dir_count": len([path for path in worktrees.iterdir() if path.is_dir()]),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["first_mode"] == "local-merge", "first run did not local-merge")
+        require(result["second_mode"] == "local-merge", "second run did not local-merge")
+        require(result["task_state"] == "DONE", "task did not finish DONE")
+        require(result["integration_state"] == "MERGED", "task was not integrated")
+        require(result["merge_sha_valid"], "merged task missing integration SHA")
+        require(result["main_equals_task_commit"], "fast-forward SHA did not match task commit")
+        require(
+            result["main_count_after_second"] == result["main_count_after_first"],
+            "rerun created duplicate merge history",
+        )
+        require(
+            result["branch_count_after_second"] == result["branch_count_after_first"],
+            "rerun created duplicate task commit",
+        )
+        require(
+            result["integration_event_count_after_second"]
+            == result["integration_event_count_after_first"],
+            "rerun duplicated integration events",
+        )
+        require(result["integration_artifact_stable"], "rerun rewrote integration artifact")
+        require(result["worktree_dir_count"] == 1, "rerun created duplicate worktrees")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_integration_merge_conflict_blocked() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="integration-conflict-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        state = tmp_dir / "state"
+        init_fixture_repo(repo)
+        program_file = state / "program.json"
+        queue_file = state / "queue.json"
+        artifacts = state / "artifacts"
+        conflict_path = "agent-loop-results/conflict.md"
+        tasks = [
+            worktree_task(
+                "task-conflict-a",
+                local_action={
+                    "adapter": local_agent_loop_v0.DETERMINISTIC_FILE_ADAPTER,
+                    "inputs": {"path": conflict_path, "content": "alpha\n"},
+                },
+            ),
+            worktree_task(
+                "task-conflict-b",
+                local_action={
+                    "adapter": local_agent_loop_v0.DETERMINISTIC_FILE_ADAPTER,
+                    "inputs": {"path": conflict_path, "content": "bravo\n"},
+                },
+            ),
+        ]
+        write_json(program_file, worktree_program_doc("program-conflict"))
+        write_json(queue_file, queue_doc(tasks))
+        local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=2,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=worktree_config(repo, worktrees),
+        )
+        queue_done = read_json(queue_file)
+        summary = local_program_loop_v0.integrate_completed_tasks(
+            queue=queue_done,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            policy=integration_policy(repo, "local-merge"),
+        )
+        queue_after = read_json(queue_file)
+        local_program_loop_v0.write_outcome_reports(
+            read_json(program_file),
+            queue_after,
+            artifacts,
+            None,
+            local_program_loop_v0.utc_now(),
+        )
+        states = {
+            task["id"]: task["integration_state"]
+            for task in queue_after["tasks"]
+        }
+        blocked_record = next(
+            record
+            for record in summary["records"]
+            if record["final_integration_state"] == "BLOCKED"
+        )
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_after,
+            artifacts,
+        )
+        result = {
+            "states": states,
+            "blocked_reason": blocked_record["skipped_reasons"][0],
+            "conflict_paths": blocked_record["conflict_diagnostics"][0]["unmerged_paths"],
+            "repo_clean_after": git_stdout(repo, ["status", "--porcelain"]) == "",
+            "execution_states": [task["state"] for task in queue_after["tasks"]],
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(states["task-conflict-a"] == "MERGED", "first conflict task did not merge")
+        require(states["task-conflict-b"] == "BLOCKED", "conflicting task was not blocked")
+        require(result["blocked_reason"] == "merge conflict", "missing conflict reason")
+        require(result["conflict_paths"] == [conflict_path], "conflict path not captured")
+        require(result["repo_clean_after"], "merge conflict did not abort cleanly")
+        require(result["execution_states"] == ["DONE", "DONE"], "execution artifacts mutated")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_integration_target_base_moved_blocked() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="integration-base-moved-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-base-moved"
+        queue_out, _, queue_file, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id),
+            repo,
+            worktrees,
+        )
+        (repo / "README.md").write_text("# Fixture Repository\n\nbase moved\n", encoding="utf-8")
+        run_cmd(["git", "add", "README.md"], cwd=repo)
+        run_cmd(["git", "commit", "-m", "Move target base"], cwd=repo)
+        moved_sha = git_stdout(repo, ["rev-parse", "main"])
+
+        summary = local_program_loop_v0.integrate_completed_tasks(
+            queue=queue_out,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            policy=integration_policy(repo, "local-merge"),
+        )
+        queue_after = read_json(queue_file)
+        record = summary["records"][0]
+        result = {
+            "integration_state": queue_after["tasks"][0]["integration_state"],
+            "blocked_reason": record["skipped_reasons"][0],
+            "main_unchanged": git_stdout(repo, ["rev-parse", "main"]) == moved_sha,
+            "merge_sha": record["merge_commit_sha"],
+        }
+        require(result["integration_state"] == "BLOCKED", "base move did not block")
+        require(
+            result["blocked_reason"] == "target base moved unexpectedly",
+            "base move diagnostic missing",
+        )
+        require(result["main_unchanged"], "blocked base move mutated main")
+        require(result["merge_sha"] is None, "blocked base move recorded merge SHA")
+        return result
+
+
+def scenario_integration_rejects_not_done_task() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="integration-not-done-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-not-done-integration"
+        queue_out, _, queue_file, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id, validation_mode="failure"),
+            repo,
+            worktrees,
+        )
+        summary = local_program_loop_v0.integrate_completed_tasks(
+            queue=queue_out,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            policy=integration_policy(repo, "report-only"),
+        )
+        queue_after = read_json(queue_file)
+        reasons = summary["records"][0]["skipped_reasons"]
+        result = {
+            "task_state": queue_after["tasks"][0]["state"],
+            "integration_state": queue_after["tasks"][0]["integration_state"],
+            "task_not_done_detected": "task is not DONE" in reasons,
+            "validation_failed_detected": "validation failed" in reasons,
+        }
+        require(result["task_state"] == "FAILED", "fixture did not produce failed task")
+        require(result["integration_state"] == "SKIPPED", "not-DONE task was not skipped")
+        require(result["task_not_done_detected"], "missing task-not-DONE diagnostic")
+        require(result["validation_failed_detected"], "missing validation failure diagnostic")
+        return result
+
+
+def scenario_integration_ambiguous_branch_rejected() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="integration-ambiguous-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-ambiguous-integration"
+        queue_out, _, queue_file, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id),
+            repo,
+            worktrees,
+        )
+        cfg = worktree_config(repo, worktrees)
+        task_worktree = worktree_path(task_id, cfg)
+        (task_worktree / "EXTRA.md").write_text("extra\n", encoding="utf-8")
+        run_cmd(["git", "add", "EXTRA.md"], cwd=task_worktree)
+        run_cmd(["git", "commit", "-m", "Ambiguous extra task commit"], cwd=task_worktree)
+
+        summary = local_program_loop_v0.integrate_completed_tasks(
+            queue=queue_out,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            policy=integration_policy(repo, "local-merge"),
+        )
+        queue_after = read_json(queue_file)
+        reasons = summary["records"][0]["skipped_reasons"]
+        result = {
+            "integration_state": queue_after["tasks"][0]["integration_state"],
+            "ambiguous_detected": "task branch is ambiguous" in reasons,
+            "main_commit_count": int(git_stdout(repo, ["rev-list", "--count", "main"])),
+        }
+        require(result["integration_state"] == "FAILED", "ambiguous branch did not fail")
+        require(result["ambiguous_detected"], "ambiguous branch diagnostic missing")
+        require(result["main_commit_count"] == 1, "ambiguous branch mutated main")
+        return result
+
+
+def scenario_integrated_artifact_integrity() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="integration-artifact-integrity-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        state = tmp_dir / "state"
+        init_fixture_repo(repo)
+        task_id = "task-integrated-artifact-integrity"
+        program_file = state / "program.json"
+        queue_file = state / "queue.json"
+        artifacts = state / "artifacts"
+        write_json(program_file, worktree_program_doc("program-integrity"))
+        write_json(queue_file, queue_doc([command_backed_task(task_id)]))
+        local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=1,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=worktree_config(repo, worktrees),
+            integration_policy=integration_policy(repo, "local-merge"),
+        )
+        program_out = read_json(program_file)
+        queue_out = read_json(queue_file)
+        metadata_path = artifacts / f"{task_id}/worktree.json"
+        integration_path = artifacts / f"{task_id}/integration.json"
+        original_metadata_text = metadata_path.read_text(encoding="utf-8")
+        original_integration_text = integration_path.read_text(encoding="utf-8")
+        report_path = artifacts / "integration_report.json"
+        original_report_text = report_path.read_text(encoding="utf-8")
+        clean_errors = local_program_loop_v0.verify_artifact_integrity(
+            program_out,
+            queue_out,
+            artifacts,
+        )
+
+        metadata = read_json(metadata_path)
+        metadata.pop("action_adapter")
+        write_json(metadata_path, metadata)
+        missing_adapter_errors = local_program_loop_v0.verify_artifact_integrity(
+            program_out,
+            queue_out,
+            artifacts,
+        )
+        metadata_path.write_text(original_metadata_text, encoding="utf-8")
+
+        metadata = read_json(metadata_path)
+        metadata["validation_command_outputs"] = []
+        write_json(metadata_path, metadata)
+        missing_evidence_errors = local_program_loop_v0.verify_artifact_integrity(
+            program_out,
+            queue_out,
+            artifacts,
+        )
+        metadata_path.write_text(original_metadata_text, encoding="utf-8")
+
+        metadata = read_json(metadata_path)
+        metadata["commit_sha"] = None
+        write_json(metadata_path, metadata)
+        missing_commit_errors = local_program_loop_v0.verify_artifact_integrity(
+            program_out,
+            queue_out,
+            artifacts,
+        )
+        metadata_path.write_text(original_metadata_text, encoding="utf-8")
+
+        integration_path.unlink()
+        missing_integration_errors = local_program_loop_v0.verify_artifact_integrity(
+            program_out,
+            queue_out,
+            artifacts,
+        )
+        integration_path.write_text(original_integration_text, encoding="utf-8")
+
+        integration = read_json(integration_path)
+        integration["integration_mode"] = "report-only"
+        write_json(integration_path, integration)
+        mode_tamper_errors = local_program_loop_v0.verify_artifact_integrity(
+            program_out,
+            queue_out,
+            artifacts,
+        )
+        integration_path.write_text(original_integration_text, encoding="utf-8")
+
+        integration = read_json(integration_path)
+        integration["merge_commit_sha"] = None
+        write_json(integration_path, integration)
+        missing_merge_errors = local_program_loop_v0.verify_artifact_integrity(
+            program_out,
+            queue_out,
+            artifacts,
+        )
+        integration_path.write_text(original_integration_text, encoding="utf-8")
+
+        report = read_json(report_path)
+        report["candidate_count"] = 999
+        write_json(report_path, report)
+        report_count_errors = local_program_loop_v0.verify_artifact_integrity(
+            program_out,
+            queue_out,
+            artifacts,
+        )
+        report_path.write_text(original_report_text, encoding="utf-8")
+
+        report = read_json(report_path)
+        report["task_results"] = []
+        write_json(report_path, report)
+        report_task_errors = local_program_loop_v0.verify_artifact_integrity(
+            program_out,
+            queue_out,
+            artifacts,
+        )
+
+        result = {
+            "clean_error_count": len(clean_errors),
+            "missing_adapter_detected": any(
+                "missing action_adapter" in err for err in missing_adapter_errors
+            ),
+            "missing_evidence_detected": any(
+                "missing validation command evidence" in err
+                for err in missing_evidence_errors
+            ),
+            "missing_commit_detected": any(
+                "DONE task missing commit SHA" in err for err in missing_commit_errors
+            ),
+            "missing_integration_detected": any(
+                "missing integration metadata" in err for err in missing_integration_errors
+            ),
+            "mode_tamper_detected": any(
+                "integration mode mismatch" in err for err in mode_tamper_errors
+            ),
+            "missing_merge_detected": any(
+                "MERGED integration missing merge SHA" in err for err in missing_merge_errors
+            ),
+            "report_count_tamper_detected": any(
+                "candidate_count" in err for err in report_count_errors
+            ),
+            "report_task_tamper_detected": any(
+                "task_results length" in err for err in report_task_errors
+            ),
+        }
+        require(result["clean_error_count"] == 0, f"clean artifacts failed: {clean_errors}")
+        require(result["missing_adapter_detected"], "missing adapter was not detected")
+        require(result["missing_evidence_detected"], "missing evidence was not detected")
+        require(result["missing_commit_detected"], "missing commit was not detected")
+        require(result["missing_integration_detected"], "missing integration was not detected")
+        require(result["mode_tamper_detected"], "integration mode tamper was not detected")
+        require(result["missing_merge_detected"], "missing merge SHA was not detected")
+        require(result["report_count_tamper_detected"], "report count tamper was not detected")
+        require(result["report_task_tamper_detected"], "report task tamper was not detected")
+        return result
+
+
+def scenario_integration_dirty_target_blocked() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="integration-dirty-target-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-dirty-target"
+        queue_out, _, queue_file, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id),
+            repo,
+            worktrees,
+        )
+        main_before = git_stdout(repo, ["rev-parse", "main"])
+        (repo / "README.md").write_text(
+            "# Fixture Repository\n\nuncommitted target change\n",
+            encoding="utf-8",
+        )
+        summary = local_program_loop_v0.integrate_completed_tasks(
+            queue=queue_out,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            policy=integration_policy(repo, "local-merge"),
+        )
+        queue_after = read_json(queue_file)
+        record = summary["records"][0]
+        result = {
+            "integration_state": queue_after["tasks"][0]["integration_state"],
+            "blocked_reason": record["skipped_reasons"][0],
+            "main_unchanged": git_stdout(repo, ["rev-parse", "main"]) == main_before,
+            "dirty_preserved": git_stdout(repo, ["status", "--porcelain"]) != "",
+        }
+        require(result["integration_state"] == "BLOCKED", "dirty target did not block")
+        require(result["blocked_reason"] == "target repo is not clean", "bad dirty diagnostic")
+        require(result["main_unchanged"], "dirty target integration mutated main")
+        require(result["dirty_preserved"], "dirty target diagnostics lost working tree change")
+        return result
+
+
+def scenario_integration_policy_contract_rejects_branch() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="integration-policy-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-policy-branch"
+        queue_out, _, queue_file, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id),
+            repo,
+            worktrees,
+        )
+        policy_file = tmp_dir / "integration-policy.json"
+        write_json(
+            policy_file,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "target_base_ref": "main",
+                "allowed_branch_prefixes": ["policy-only/"],
+                "require_clean_target": True,
+                "allow_fast_forward": True,
+                "allow_merge_commit": True,
+            },
+        )
+        policy = local_program_loop_v0.build_integration_policy(
+            "report-only",
+            repo,
+            "main",
+            "codex/local-agent-loop",
+            policy_file,
+        )
+        require(policy is not None, "policy file did not produce policy")
+        summary = local_program_loop_v0.integrate_completed_tasks(
+            queue=queue_out,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            policy=policy,
+        )
+        queue_after = read_json(queue_file)
+        reasons = summary["records"][0]["skipped_reasons"]
+        result = {
+            "integration_state": queue_after["tasks"][0]["integration_state"],
+            "policy_prefix": policy.allowed_branch_prefixes[0],
+            "branch_policy_detected": (
+                "task branch is not allowed by integration policy" in reasons
+            ),
+        }
+        require(result["integration_state"] == "FAILED", "policy branch violation did not fail")
+        require(result["policy_prefix"] == "policy-only/", "policy file prefix not loaded")
+        require(result["branch_policy_detected"], "policy branch diagnostic missing")
+        return result
+
+
 def scenario_determinism() -> dict[str, Any]:
     orders = []
     for _ in range(20):
@@ -2301,6 +2943,21 @@ def build_summary() -> dict[str, Any]:
         "validation_output_spoof_detection": scenario_validation_output_spoof_detection,
         "deterministic_validation_evidence_integrity": (
             scenario_deterministic_validation_evidence_integrity
+        ),
+        "report_only_integration": scenario_report_only_integration,
+        "local_merge_integration_idempotency": scenario_local_merge_integration_idempotency,
+        "integration_merge_conflict_blocked": scenario_integration_merge_conflict_blocked,
+        "integration_target_base_moved_blocked": (
+            scenario_integration_target_base_moved_blocked
+        ),
+        "integration_rejects_not_done_task": scenario_integration_rejects_not_done_task,
+        "integration_ambiguous_branch_rejected": (
+            scenario_integration_ambiguous_branch_rejected
+        ),
+        "integrated_artifact_integrity": scenario_integrated_artifact_integrity,
+        "integration_dirty_target_blocked": scenario_integration_dirty_target_blocked,
+        "integration_policy_contract_rejects_branch": (
+            scenario_integration_policy_contract_rejects_branch
         ),
         "deterministic_scheduling_20_runs": scenario_determinism,
     }

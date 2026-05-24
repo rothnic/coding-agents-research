@@ -1,6 +1,6 @@
 {
-  "scenario_count": 40,
-  "scenario_pass_count": 40,
+  "scenario_count": 49,
+  "scenario_pass_count": 49,
   "scenarios": {
     "all_tasks_blocked": {
       "all_program_events_have_state_fields": true,
@@ -490,6 +490,61 @@
       ],
       "program_state_after": "IDLE"
     },
+    "integrated_artifact_integrity": {
+      "clean_error_count": 0,
+      "missing_adapter_detected": true,
+      "missing_commit_detected": true,
+      "missing_evidence_detected": true,
+      "missing_integration_detected": true,
+      "missing_merge_detected": true,
+      "mode_tamper_detected": true,
+      "report_count_tamper_detected": true,
+      "report_task_tamper_detected": true
+    },
+    "integration_ambiguous_branch_rejected": {
+      "ambiguous_detected": true,
+      "integration_state": "FAILED",
+      "main_commit_count": 1
+    },
+    "integration_dirty_target_blocked": {
+      "blocked_reason": "target repo is not clean",
+      "dirty_preserved": true,
+      "integration_state": "BLOCKED",
+      "main_unchanged": true
+    },
+    "integration_merge_conflict_blocked": {
+      "blocked_reason": "merge conflict",
+      "conflict_paths": [
+        "agent-loop-results/conflict.md"
+      ],
+      "execution_states": [
+        "DONE",
+        "DONE"
+      ],
+      "integrity_error_count": 0,
+      "repo_clean_after": true,
+      "states": {
+        "task-conflict-a": "MERGED",
+        "task-conflict-b": "BLOCKED"
+      }
+    },
+    "integration_policy_contract_rejects_branch": {
+      "branch_policy_detected": true,
+      "integration_state": "FAILED",
+      "policy_prefix": "policy-only/"
+    },
+    "integration_rejects_not_done_task": {
+      "integration_state": "SKIPPED",
+      "task_not_done_detected": true,
+      "task_state": "FAILED",
+      "validation_failed_detected": true
+    },
+    "integration_target_base_moved_blocked": {
+      "blocked_reason": "target base moved unexpectedly",
+      "integration_state": "BLOCKED",
+      "main_unchanged": true,
+      "merge_sha": null
+    },
     "interrupted_run_recovery": {
       "events": [
         {
@@ -549,6 +604,23 @@
       ],
       "unique_task_id_count": 1
     },
+    "local_merge_integration_idempotency": {
+      "branch_count_after_first": 2,
+      "branch_count_after_second": 2,
+      "first_mode": "local-merge",
+      "integration_artifact_stable": true,
+      "integration_event_count_after_first": 1,
+      "integration_event_count_after_second": 1,
+      "integration_state": "MERGED",
+      "integrity_error_count": 0,
+      "main_count_after_first": 2,
+      "main_count_after_second": 2,
+      "main_equals_task_commit": true,
+      "merge_sha_valid": true,
+      "second_mode": "local-merge",
+      "task_state": "DONE",
+      "worktree_dir_count": 1
+    },
     "malformed_input_rejected_before_mutation": {
       "artifacts_created": false,
       "mentions_dependency": true,
@@ -564,6 +636,19 @@
       "integrity_error_count": 0,
       "task_state": "FAILED",
       "validation_message": "command-backed-patch-fixture requires validation_commands"
+    },
+    "report_only_integration": {
+      "artifact_state": "READY",
+      "event_count_after_first": 1,
+      "event_count_after_second": 1,
+      "integration_artifact_stable": true,
+      "integration_mode": "report-only",
+      "integrity_error_count": 0,
+      "main_unchanged": true,
+      "merge_sha": null,
+      "report_ready_count": 1,
+      "status_ready_count": 1,
+      "task_integration_state": "READY"
     },
     "rerun_idempotency": {
       "first_generated": [
