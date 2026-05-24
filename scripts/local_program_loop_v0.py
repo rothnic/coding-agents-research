@@ -16,8 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from local_agent_loop_v0 import (
+    COMMAND_BACKED_PATCH_ADAPTER,
+    COMMAND_OUTPUTS_DIR,
     REQUIRED_TASK_ARTIFACTS,
     SCHEMA_VERSION,
+    SUPPORTED_WORKTREE_ACTION_ADAPTERS,
     TERMINAL_STATES,
     TASK_STATES,
     WORKTREE_METADATA_ARTIFACT,
@@ -739,6 +742,142 @@ def is_commit_sha(value: Any) -> bool:
     )
 
 
+def command_identity(command: Any, argv_field: str = "argv") -> tuple[str, tuple[str, ...], float] | None:
+    if not isinstance(command, dict):
+        return None
+    name = command.get("name")
+    argv = command.get(argv_field)
+    timeout = command.get("timeout_sec")
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or not isinstance(argv, list)
+        or not all(isinstance(part, str) for part in argv)
+        or isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+    ):
+        return None
+    return (name, tuple(argv), float(timeout))
+
+
+def expected_command_identities(
+    metadata: dict[str, Any],
+    field: str,
+) -> list[tuple[str, tuple[str, ...], float]]:
+    if field == "validation_command_outputs":
+        commands = metadata.get("validation_commands")
+        if not isinstance(commands, list):
+            return []
+        return [
+            identity
+            for command in commands
+            if (identity := command_identity(command, "argv")) is not None
+        ]
+    if field == "action_command_outputs":
+        action_inputs = metadata.get("action_inputs")
+        identity = command_identity(action_inputs, "command")
+        return [identity] if identity is not None else []
+    return []
+
+
+def verify_command_output_artifacts(
+    task_id: str,
+    task_dir: Path,
+    metadata: dict[str, Any],
+    errors: list[str],
+) -> None:
+    expected_kinds = {
+        "action_command_outputs": "action",
+        "validation_command_outputs": "validation",
+    }
+    for field, expected_kind in expected_kinds.items():
+        outputs = metadata.get(field)
+        if outputs is None:
+            errors.append(f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: missing {field}")
+            continue
+        if not isinstance(outputs, list):
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: {field} must be a list"
+            )
+            continue
+        for index, output in enumerate(outputs):
+            label = f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}.{field}[{index}]"
+            if not isinstance(output, dict):
+                errors.append(f"{label}: expected object")
+                continue
+            artifact = output.get("output_artifact")
+            if not isinstance(artifact, str) or not artifact.strip():
+                errors.append(f"{label}: missing output_artifact")
+                continue
+            artifact_path = Path(artifact)
+            if artifact_path.is_absolute() or ".." in artifact_path.parts:
+                errors.append(f"{label}: unsafe output_artifact")
+                continue
+            if not artifact_path.parts or artifact_path.parts[0] != COMMAND_OUTPUTS_DIR:
+                errors.append(f"{label}: output_artifact must be under {COMMAND_OUTPUTS_DIR}")
+                continue
+            output_path = task_dir / artifact_path
+            if not output_path.exists():
+                errors.append(f"artifacts/{task_id}/{artifact}: missing command output artifact")
+                continue
+            if output_path.stat().st_size == 0:
+                errors.append(f"artifacts/{task_id}/{artifact}: command output artifact is empty")
+                continue
+            output_doc = read_artifact_object(output_path, errors)
+            if output_doc is None:
+                continue
+            for mirrored_field in (
+                "kind",
+                "name",
+                "argv",
+                "returncode",
+                "timed_out",
+                "timeout_sec",
+                "output_artifact",
+                "stdout",
+                "stderr",
+            ):
+                if output_doc.get(mirrored_field) != output.get(mirrored_field):
+                    errors.append(
+                        f"artifacts/{task_id}/{artifact}: {mirrored_field} "
+                        "does not match metadata"
+                    )
+            if output_doc.get("schema_version") != SCHEMA_VERSION:
+                errors.append(f"artifacts/{task_id}/{artifact}: unsupported schema version")
+            if output_doc.get("task_id") != task_id:
+                errors.append(f"artifacts/{task_id}/{artifact}: task_id mismatch")
+            if output_doc.get("output_artifact") != artifact:
+                errors.append(f"artifacts/{task_id}/{artifact}: output_artifact mismatch")
+            if output_doc.get("kind") != expected_kind:
+                errors.append(
+                    f"artifacts/{task_id}/{artifact}: expected {expected_kind} command output"
+                )
+            for string_field in ("name", "kind", "stdout", "stderr"):
+                if not isinstance(output_doc.get(string_field), str):
+                    errors.append(f"artifacts/{task_id}/{artifact}: {string_field} must be string")
+            if not isinstance(output_doc.get("argv"), list):
+                errors.append(f"artifacts/{task_id}/{artifact}: argv must be list")
+            if output_doc.get("returncode") is not None and not isinstance(
+                output_doc.get("returncode"), int
+            ):
+                errors.append(f"artifacts/{task_id}/{artifact}: returncode must be int or null")
+            if not isinstance(output_doc.get("timed_out"), bool):
+                errors.append(f"artifacts/{task_id}/{artifact}: timed_out must be boolean")
+        expected = expected_command_identities(metadata, field)
+        actual = [
+            identity
+            for output in outputs
+            if (identity := command_identity(output, "argv")) is not None
+        ]
+        if expected and actual != expected and (
+            outputs or metadata.get("final_task_state") == "DONE"
+        ):
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: "
+                f"{field} does not match declared commands"
+            )
+
+
 def verify_worktree_metadata(
     task: dict[str, Any],
     task_dir: Path,
@@ -779,6 +918,57 @@ def verify_worktree_metadata(
         errors.append(
             f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: final task state mismatch"
         )
+    action_adapter = metadata.get("action_adapter")
+    if not isinstance(action_adapter, str) or not action_adapter.strip():
+        if task.get("state") == "DONE":
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: missing action_adapter"
+            )
+    elif action_adapter not in SUPPORTED_WORKTREE_ACTION_ADAPTERS and task.get("state") == "DONE":
+        errors.append(
+            f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: unknown action_adapter"
+        )
+    elif task.get("worktree_action_adapter") and action_adapter != task.get(
+        "worktree_action_adapter"
+    ):
+        errors.append(
+            f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: action_adapter mismatch"
+        )
+    if task.get("state") == "DONE" and not isinstance(metadata.get("action_inputs"), dict):
+        errors.append(f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: missing action_inputs")
+    expected_change_paths = metadata.get("expected_change_paths")
+    if task.get("state") == "DONE" and (
+        not isinstance(expected_change_paths, list) or not expected_change_paths
+    ):
+        errors.append(
+            f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: missing expected_change_paths"
+        )
+    elif isinstance(expected_change_paths, list) and not all(
+        isinstance(path, str) and path.strip() for path in expected_change_paths
+    ):
+        errors.append(
+            f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: invalid expected_change_paths"
+        )
+    has_validation_commands = (
+        isinstance(metadata.get("validation_commands"), list)
+        and bool(metadata["validation_commands"])
+    )
+    validation_outputs = metadata.get("validation_command_outputs")
+    has_validation_outputs = isinstance(validation_outputs, list) and bool(validation_outputs)
+    if task.get("state") == "DONE":
+        if action_adapter == COMMAND_BACKED_PATCH_ADAPTER and not has_validation_commands:
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: "
+                "command-backed adapter missing validation_commands"
+            )
+        if (has_validation_commands or action_adapter == COMMAND_BACKED_PATCH_ADAPTER) and (
+            not has_validation_outputs
+        ):
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: "
+                "missing validation command evidence"
+            )
+    verify_command_output_artifacts(task_id, task_dir, metadata, errors)
     validation_output = metadata.get("validation_output")
     if not isinstance(validation_output, dict):
         errors.append(
@@ -788,6 +978,13 @@ def verify_worktree_metadata(
         if validation_output.get("task_id") != task_id:
             errors.append(
                 f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: validation task_id mismatch"
+            )
+        if validation_output.get("action_adapter") and validation_output.get(
+            "action_adapter"
+        ) != action_adapter:
+            errors.append(
+                f"artifacts/{task_id}/{WORKTREE_METADATA_ARTIFACT}: "
+                "validation action_adapter mismatch"
             )
         if task.get("state") == "DONE" and validation_output.get("passed") is not True:
             errors.append(

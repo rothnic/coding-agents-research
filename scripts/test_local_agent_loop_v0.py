@@ -114,6 +114,70 @@ def worktree_task(task_id: str, **fields: Any) -> dict[str, Any]:
     return task
 
 
+def command_backed_task(
+    task_id: str,
+    *,
+    validation_mode: str = "success",
+    include_validation: bool = True,
+    ambiguous_validation_command: bool = False,
+) -> dict[str, Any]:
+    path = f"agent-loop-results/{local_agent_loop_v0.worktree_task_key(task_id)}-command.md"
+    content = f"# Command Backed Fixture\n\nTask: {task_id}\n"
+    action_py = (
+        "from pathlib import Path; "
+        f"p=Path({path!r}); "
+        "p.parent.mkdir(parents=True, exist_ok=True); "
+        f"p.write_text({content!r}, encoding='utf-8')"
+    )
+    action_argv = ["python3", "-c", action_py]
+    if validation_mode == "success":
+        validation_py = (
+            "from pathlib import Path; "
+            f"data=Path({path!r}).read_text(encoding='utf-8'); "
+            f"assert data == {content!r}; "
+            "print('validated command-backed fixture')"
+        )
+        validation_timeout = 5
+    elif validation_mode == "failure":
+        validation_py = "import sys; print('validation failed', file=sys.stderr); sys.exit(7)"
+        validation_timeout = 5
+    elif validation_mode == "timeout":
+        validation_py = "import time; time.sleep(2); print('late validation')"
+        validation_timeout = 0.1
+    else:
+        raise AssertionError(f"unknown validation mode {validation_mode!r}")
+    validation_argv = ["python3", "-c", validation_py]
+    task = worktree_task(
+        task_id,
+        required_checks=["command-fixture"],
+        local_action={
+            "adapter": local_agent_loop_v0.COMMAND_BACKED_PATCH_ADAPTER,
+            "inputs": {
+                "name": "write-command-fixture",
+                "command": action_argv,
+                "allowed_commands": [action_argv],
+                "timeout_sec": 5,
+                "expected_path": path,
+                "expected_content": content,
+            },
+        },
+    )
+    if include_validation:
+        task["validation_commands"] = [
+            {
+                "name": "verify-command-fixture",
+                "command": (
+                    " ".join(validation_argv)
+                    if ambiguous_validation_command
+                    else validation_argv
+                ),
+                "timeout_sec": validation_timeout,
+            }
+        ]
+        task["validation_command_allowlist"] = [validation_argv]
+    return task
+
+
 def worktree_config(repo: Path, worktrees_dir: Path) -> local_agent_loop_v0.WorktreeConfig:
     return local_agent_loop_v0.WorktreeConfig(
         repo=repo,
@@ -1515,6 +1579,660 @@ def scenario_worktree_relative_dir_cli() -> dict[str, Any]:
         return result
 
 
+def scenario_command_backed_adapter_success() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="command-backed-success-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-command-backed-success"
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        metadata = read_json(artifacts / f"{task_id}/worktree.json")
+        validation = read_json(artifacts / f"{task_id}/validation.json")
+        validation_output = metadata["validation_command_outputs"][0]
+        output_artifact = artifacts / task_id / validation_output["output_artifact"]
+        branch = worktree_branch(task_id, worktree_config(repo, worktrees))
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "task_state": task["state"],
+            "adapter": metadata["action_adapter"],
+            "commit_sha_valid": local_program_loop_v0.is_commit_sha(
+                task.get("worktree_commit_sha")
+            ),
+            "validation_passed": validation["passed"],
+            "action_output_count": len(metadata["action_command_outputs"]),
+            "validation_output_count": len(metadata["validation_command_outputs"]),
+            "validation_stdout_captured": (
+                "validated command-backed fixture" in validation_output["stdout"]
+            ),
+            "output_artifact_exists": output_artifact.exists(),
+            "commit_count_on_branch": int(git_stdout(repo, ["rev-list", "--count", branch])),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "DONE", "command-backed task did not finish DONE")
+        require(
+            result["adapter"] == local_agent_loop_v0.COMMAND_BACKED_PATCH_ADAPTER,
+            "metadata recorded wrong adapter",
+        )
+        require(result["commit_sha_valid"], "command-backed task missing commit")
+        require(result["validation_passed"], "command-backed validation failed")
+        require(result["action_output_count"] == 1, "action command output not captured")
+        require(result["validation_output_count"] == 1, "validation command output not captured")
+        require(result["validation_stdout_captured"], "validation stdout missing")
+        require(result["output_artifact_exists"], "validation output artifact missing")
+        require(result["commit_count_on_branch"] == 2, "command-backed branch commit count wrong")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_command_backed_validation_failure_no_commit() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="command-backed-validation-fail-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-command-backed-validation-fail"
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id, validation_mode="failure"),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        metadata = read_json(artifacts / f"{task_id}/worktree.json")
+        validation_output = metadata["validation_command_outputs"][0]
+        branch = worktree_branch(task_id, worktree_config(repo, worktrees))
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "task_state": task["state"],
+            "commit_sha": task.get("worktree_commit_sha"),
+            "metadata_commit_sha": metadata["commit_sha"],
+            "validation_exit_code": validation_output["returncode"],
+            "validation_stderr_captured": "validation failed" in validation_output["stderr"],
+            "branch_commit_count": int(git_stdout(repo, ["rev-list", "--count", branch])),
+            "dirty_after_detected": bool(metadata["dirty_status_after"]),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "FAILED", "validation failure did not fail task")
+        require(result["commit_sha"] is None, "validation failure recorded task commit")
+        require(result["metadata_commit_sha"] is None, "validation failure recorded metadata commit")
+        require(result["validation_exit_code"] == 7, "validation exit code was not captured")
+        require(result["validation_stderr_captured"], "validation stderr was not captured")
+        require(result["branch_commit_count"] == 1, "validation failure created commit")
+        require(result["dirty_after_detected"], "validation failure lost dirty diagnostics")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_command_backed_validation_timeout_no_commit() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="command-backed-timeout-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-command-backed-timeout"
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id, validation_mode="timeout"),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        metadata = read_json(artifacts / f"{task_id}/worktree.json")
+        validation_output = metadata["validation_command_outputs"][0]
+        branch = worktree_branch(task_id, worktree_config(repo, worktrees))
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "task_state": task["state"],
+            "commit_sha": task.get("worktree_commit_sha"),
+            "metadata_commit_sha": metadata["commit_sha"],
+            "command_timed_out": metadata["command_timed_out"],
+            "validation_timed_out": validation_output["timed_out"],
+            "validation_returncode": validation_output["returncode"],
+            "branch_commit_count": int(git_stdout(repo, ["rev-list", "--count", branch])),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "FAILED", "timeout did not fail task")
+        require(result["commit_sha"] is None, "timeout recorded task commit")
+        require(result["metadata_commit_sha"] is None, "timeout recorded metadata commit")
+        require(result["command_timed_out"], "metadata did not record timeout")
+        require(result["validation_timed_out"], "validation output did not record timeout")
+        require(result["validation_returncode"] is None, "timeout returncode should be null")
+        require(result["branch_commit_count"] == 1, "timeout created commit")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_command_backed_rerun_idempotency() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="command-backed-rerun-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        state = tmp_dir / "state"
+        init_fixture_repo(repo)
+        task_id = "task-command-backed-once"
+        program_file = state / "program.json"
+        queue_file = state / "queue.json"
+        artifacts = state / "artifacts"
+        write_json(program_file, worktree_program_doc("program-command-rerun"))
+        write_json(queue_file, queue_doc([command_backed_task(task_id)]))
+        cfg = worktree_config(repo, worktrees)
+        local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=1,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=cfg,
+        )
+        first_queue = read_json(queue_file)
+        first_metadata = read_json(artifacts / f"{task_id}/worktree.json")
+        events_after_first = read_ndjson(artifacts / f"{task_id}/events.ndjson")
+        branch = worktree_branch(task_id, cfg)
+        commit_count_after_first = int(git_stdout(repo, ["rev-list", "--count", branch]))
+        local_program_loop_v0.run_program(
+            program_file=program_file,
+            queue_file=queue_file,
+            artifacts=artifacts,
+            min_open=1,
+            timeout_s=300,
+            max_retries=2,
+            worktree_config=cfg,
+        )
+        second_queue = read_json(queue_file)
+        second_metadata = read_json(artifacts / f"{task_id}/worktree.json")
+        events_after_second = read_ndjson(artifacts / f"{task_id}/events.ndjson")
+        result = {
+            "same_commit_sha": (
+                first_queue["tasks"][0]["worktree_commit_sha"]
+                == second_queue["tasks"][0]["worktree_commit_sha"]
+            ),
+            "commit_count_after_first": commit_count_after_first,
+            "commit_count_after_second": int(git_stdout(repo, ["rev-list", "--count", branch])),
+            "event_count_after_first": len(events_after_first),
+            "event_count_after_second": len(events_after_second),
+            "worktree_dir_count": len([path for path in worktrees.iterdir() if path.is_dir()]),
+            "action_output_count_stable": (
+                len(first_metadata["action_command_outputs"])
+                == len(second_metadata["action_command_outputs"])
+            ),
+            "validation_output_count_stable": (
+                len(first_metadata["validation_command_outputs"])
+                == len(second_metadata["validation_command_outputs"])
+            ),
+        }
+        require(result["same_commit_sha"], "rerun changed command-backed commit")
+        require(
+            result["commit_count_after_second"] == result["commit_count_after_first"],
+            "rerun created duplicate command-backed commit",
+        )
+        require(
+            result["event_count_after_second"] == result["event_count_after_first"],
+            "rerun duplicated command-backed events",
+        )
+        require(result["worktree_dir_count"] == 1, "rerun created duplicate worktrees")
+        require(result["action_output_count_stable"], "rerun duplicated action outputs")
+        require(result["validation_output_count_stable"], "rerun duplicated validation outputs")
+        return result
+
+
+def scenario_command_backed_missing_output_artifact_detection() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="command-backed-missing-output-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-command-backed-missing-output"
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id),
+            repo,
+            worktrees,
+        )
+        metadata_path = artifacts / f"{task_id}/worktree.json"
+        metadata = read_json(metadata_path)
+        output_artifact = artifacts / task_id / metadata["validation_command_outputs"][0][
+            "output_artifact"
+        ]
+        output_artifact.unlink()
+        errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "error_count": len(errors),
+            "missing_command_output_detected": any(
+                "missing command output artifact" in err for err in errors
+            ),
+        }
+        require(result["error_count"] > 0, "missing command output artifact passed")
+        require(result["missing_command_output_detected"], "missing output artifact undetected")
+        return result
+
+
+def scenario_command_backed_done_metadata_integrity() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="command-backed-integrity-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-command-backed-integrity"
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id),
+            repo,
+            worktrees,
+        )
+        metadata_path = artifacts / f"{task_id}/worktree.json"
+        original_metadata = read_json(metadata_path)
+        clean_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+
+        metadata = dict(original_metadata)
+        metadata.pop("action_adapter")
+        write_json(metadata_path, metadata)
+        missing_adapter_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+
+        metadata = dict(original_metadata)
+        metadata["validation_command_outputs"] = []
+        write_json(metadata_path, metadata)
+        missing_evidence_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+
+        metadata = dict(original_metadata)
+        metadata["commit_sha"] = None
+        write_json(metadata_path, metadata)
+        missing_commit_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+
+        result = {
+            "clean_error_count": len(clean_errors),
+            "missing_adapter_detected": any(
+                "missing action_adapter" in err for err in missing_adapter_errors
+            ),
+            "missing_evidence_detected": any(
+                "missing validation command evidence" in err
+                for err in missing_evidence_errors
+            ),
+            "missing_commit_detected": any(
+                "DONE task missing commit SHA" in err for err in missing_commit_errors
+            ),
+        }
+        require(result["clean_error_count"] == 0, f"clean artifacts failed: {clean_errors}")
+        require(result["missing_adapter_detected"], "missing action adapter passed integrity")
+        require(result["missing_evidence_detected"], "missing validation evidence passed")
+        require(result["missing_commit_detected"], "missing commit SHA passed integrity")
+        return result
+
+
+def scenario_unknown_adapter_rejected() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="unknown-adapter-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-unknown-adapter"
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            worktree_task(
+                task_id,
+                local_action={"adapter": "unknown-adapter", "inputs": {}},
+            ),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        validation = read_json(artifacts / f"{task_id}/validation.json")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        branch = worktree_branch(task_id, worktree_config(repo, worktrees))
+        result = {
+            "task_state": task["state"],
+            "commit_sha": task.get("worktree_commit_sha"),
+            "validation_message": validation["message"],
+            "branch_exists": bool(git_stdout(repo, ["branch", "--list", branch])),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "FAILED", "unknown adapter was not rejected")
+        require(result["commit_sha"] is None, "unknown adapter recorded commit")
+        require("unknown worktree action adapter" in result["validation_message"], "bad diagnostic")
+        require(not result["branch_exists"], "unknown adapter created branch")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_ambiguous_validation_command_rejected() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="ambiguous-command-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-ambiguous-validation-command"
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id, ambiguous_validation_command=True),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        validation = read_json(artifacts / f"{task_id}/validation.json")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        branch = worktree_branch(task_id, worktree_config(repo, worktrees))
+        result = {
+            "task_state": task["state"],
+            "validation_message": validation["message"],
+            "branch_exists": bool(git_stdout(repo, ["branch", "--list", branch])),
+            "commit_sha": task.get("worktree_commit_sha"),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "FAILED", "ambiguous command did not fail task")
+        require("expected non-empty argv list" in result["validation_message"], "bad diagnostic")
+        require(not result["branch_exists"], "ambiguous command created branch")
+        require(result["commit_sha"] is None, "ambiguous command recorded commit")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_missing_validation_evidence_rejected() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="missing-validation-evidence-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-missing-validation-evidence"
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id, include_validation=False),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        validation = read_json(artifacts / f"{task_id}/validation.json")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        branch = worktree_branch(task_id, worktree_config(repo, worktrees))
+        result = {
+            "task_state": task["state"],
+            "validation_message": validation["message"],
+            "branch_exists": bool(git_stdout(repo, ["branch", "--list", branch])),
+            "commit_sha": task.get("worktree_commit_sha"),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "FAILED", "missing validation did not fail task")
+        require("requires validation_commands" in result["validation_message"], "bad diagnostic")
+        require(not result["branch_exists"], "missing validation created branch")
+        require(result["commit_sha"] is None, "missing validation recorded commit")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_unsafe_action_path_rejected() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="unsafe-action-path-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-unsafe-action-path"
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            worktree_task(
+                task_id,
+                local_action={
+                    "adapter": local_agent_loop_v0.DETERMINISTIC_FILE_ADAPTER,
+                    "inputs": {
+                        "path": "../escape.md",
+                        "content": "escape\n",
+                    },
+                },
+            ),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        validation = read_json(artifacts / f"{task_id}/validation.json")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        branch = worktree_branch(task_id, worktree_config(repo, worktrees))
+        result = {
+            "task_state": task["state"],
+            "validation_message": validation["message"],
+            "branch_exists": bool(git_stdout(repo, ["branch", "--list", branch])),
+            "commit_sha": task.get("worktree_commit_sha"),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "FAILED", "unsafe path did not fail task")
+        require("unsafe worktree change path" in result["validation_message"], "bad diagnostic")
+        require(not result["branch_exists"], "unsafe path created branch")
+        require(result["commit_sha"] is None, "unsafe path recorded commit")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_git_control_path_rejected() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="git-control-path-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-git-control-path"
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            worktree_task(
+                task_id,
+                local_action={
+                    "adapter": local_agent_loop_v0.DETERMINISTIC_FILE_ADAPTER,
+                    "inputs": {
+                        "path": ".git",
+                        "content": "corrupt\n",
+                    },
+                },
+            ),
+            repo,
+            worktrees,
+        )
+        task = queue_out["tasks"][0]
+        validation = read_json(artifacts / f"{task_id}/validation.json")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        branch = worktree_branch(task_id, worktree_config(repo, worktrees))
+        result = {
+            "task_state": task["state"],
+            "validation_message": validation["message"],
+            "branch_exists": bool(git_stdout(repo, ["branch", "--list", branch])),
+            "commit_sha": task.get("worktree_commit_sha"),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "FAILED", "git control path did not fail task")
+        require("unsafe worktree change path" in result["validation_message"], "bad diagnostic")
+        require(not result["branch_exists"], "git control path created branch")
+        require(result["commit_sha"] is None, "git control path recorded commit")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_ambiguous_action_command_rejected() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="ambiguous-action-command-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-ambiguous-action-command"
+        task = command_backed_task(task_id)
+        task["local_action"]["inputs"]["argv"] = [
+            "python3",
+            "-c",
+            "print('different action')",
+        ]
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            task,
+            repo,
+            worktrees,
+        )
+        task_out = queue_out["tasks"][0]
+        validation = read_json(artifacts / f"{task_id}/validation.json")
+        integrity_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        branch = worktree_branch(task_id, worktree_config(repo, worktrees))
+        result = {
+            "task_state": task_out["state"],
+            "validation_message": validation["message"],
+            "branch_exists": bool(git_stdout(repo, ["branch", "--list", branch])),
+            "commit_sha": task_out.get("worktree_commit_sha"),
+            "integrity_error_count": len(integrity_errors),
+        }
+        require(result["task_state"] == "FAILED", "ambiguous action command passed")
+        require("command and argv disagree" in result["validation_message"], "bad diagnostic")
+        require(not result["branch_exists"], "ambiguous action command created branch")
+        require(result["commit_sha"] is None, "ambiguous action command recorded commit")
+        require(result["integrity_error_count"] == 0, f"integrity failed: {integrity_errors}")
+        return result
+
+
+def scenario_validation_output_spoof_detection() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="validation-output-spoof-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-validation-output-spoof"
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            command_backed_task(task_id),
+            repo,
+            worktrees,
+        )
+        metadata_path = artifacts / f"{task_id}/worktree.json"
+        metadata = read_json(metadata_path)
+        metadata["validation_command_outputs"] = metadata["action_command_outputs"]
+        write_json(metadata_path, metadata)
+        errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "error_count": len(errors),
+            "kind_mismatch_detected": any(
+                "expected validation command output" in err for err in errors
+            ),
+            "declared_command_mismatch_detected": any(
+                "validation_command_outputs does not match declared commands" in err
+                for err in errors
+            ),
+        }
+        require(result["error_count"] > 0, "spoofed validation output passed")
+        require(result["kind_mismatch_detected"], "validation kind spoof was not detected")
+        require(
+            result["declared_command_mismatch_detected"],
+            "validation command spoof was not detected",
+        )
+        return result
+
+
+def scenario_deterministic_validation_evidence_integrity() -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="deterministic-validation-evidence-") as tmp:
+        tmp_dir = Path(tmp)
+        repo = tmp_dir / "repo"
+        worktrees = tmp_dir / "worktrees"
+        init_fixture_repo(repo)
+        task_id = "task-deterministic-validation-evidence"
+        validation_argv = ["python3", "-c", "print('deterministic validation')"]
+        task = worktree_task(
+            task_id,
+            validation_commands=[
+                {
+                    "name": "deterministic-validation",
+                    "command": validation_argv,
+                    "timeout_sec": 5,
+                }
+            ],
+            validation_command_allowlist=[validation_argv],
+        )
+        queue_out, program_file, _, artifacts = run_worktree_program(
+            tmp_dir / "state",
+            task,
+            repo,
+            worktrees,
+        )
+        metadata_path = artifacts / f"{task_id}/worktree.json"
+        metadata = read_json(metadata_path)
+        clean_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        metadata["validation_command_outputs"] = []
+        write_json(metadata_path, metadata)
+        missing_evidence_errors = local_program_loop_v0.verify_artifact_integrity(
+            read_json(program_file),
+            queue_out,
+            artifacts,
+        )
+        result = {
+            "clean_error_count": len(clean_errors),
+            "missing_evidence_detected": any(
+                "missing validation command evidence" in err
+                for err in missing_evidence_errors
+            ),
+        }
+        require(result["clean_error_count"] == 0, f"clean artifacts failed: {clean_errors}")
+        require(result["missing_evidence_detected"], "deterministic evidence gap passed")
+        return result
+
+
 def scenario_determinism() -> dict[str, Any]:
     orders = []
     for _ in range(20):
@@ -1562,6 +2280,28 @@ def build_summary() -> dict[str, Any]:
         "worktree_task_id_collision_isolated": scenario_worktree_task_id_collision_isolated,
         "worktree_metadata_tamper_detection": scenario_worktree_metadata_tamper_detection,
         "worktree_relative_dir_cli": scenario_worktree_relative_dir_cli,
+        "command_backed_adapter_success": scenario_command_backed_adapter_success,
+        "command_backed_validation_failure_no_commit": (
+            scenario_command_backed_validation_failure_no_commit
+        ),
+        "command_backed_validation_timeout_no_commit": (
+            scenario_command_backed_validation_timeout_no_commit
+        ),
+        "command_backed_rerun_idempotency": scenario_command_backed_rerun_idempotency,
+        "command_backed_missing_output_artifact_detection": (
+            scenario_command_backed_missing_output_artifact_detection
+        ),
+        "command_backed_done_metadata_integrity": scenario_command_backed_done_metadata_integrity,
+        "unknown_adapter_rejected": scenario_unknown_adapter_rejected,
+        "ambiguous_validation_command_rejected": scenario_ambiguous_validation_command_rejected,
+        "missing_validation_evidence_rejected": scenario_missing_validation_evidence_rejected,
+        "unsafe_action_path_rejected": scenario_unsafe_action_path_rejected,
+        "git_control_path_rejected": scenario_git_control_path_rejected,
+        "ambiguous_action_command_rejected": scenario_ambiguous_action_command_rejected,
+        "validation_output_spoof_detection": scenario_validation_output_spoof_detection,
+        "deterministic_validation_evidence_integrity": (
+            scenario_deterministic_validation_evidence_integrity
+        ),
         "deterministic_scheduling_20_runs": scenario_determinism,
     }
     results = {name: fn() for name, fn in scenarios.items()}
